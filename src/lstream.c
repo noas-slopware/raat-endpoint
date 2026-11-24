@@ -97,7 +97,7 @@ static int s_get_stats(lua_State *L)
 		lua_settop(L, 2);
 	}
 	pthread_mutex_lock(&s->mu);
-	int64_t fill = s->empty ? 0 : s->hi - (s->reading ? (s->rd > s->lo ? s->rd : s->lo) : s->lo);
+	int64_t fill = s->empty ? 0 : s->hi - (s->has_read ? (s->rd > s->lo ? s->rd : s->lo) : s->lo);
 	if (fill < 0)
 		fill = 0;
 	struct {

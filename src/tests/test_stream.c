@@ -124,6 +124,51 @@ static void test_full_unchanged(void)
 	}
 }
 
+/* stop, then start again at an earlier sample (resume in the Core's pause
+ * window): frames already read must still be there. */
+static void test_resume_rewind(void)
+{
+	stream_t *s = mk(16, 2, 100000);
+	uint8_t *in = malloc(30000 * 4), *out = malloc(30000 * 4);
+	for (int i = 0; i < 30000 * 4; i++)
+		in[i] = (uint8_t)(i * 31 + 7);
+	const char *err = NULL;
+	stream_write(s, 0, 0, 0, in, 30000 * 4, 30000, -1, true, &err);
+	stream_begin_read(s, 0);
+	stream_read(s, out, 20000);
+	stream_end_read(s);
+	stream_begin_read(s, 17000); /* 3000 frames back, as after a stop */
+	stream_read(s, out, 5000);
+	CHECK(!memcmp(out, in + 17000 * 4, 5000 * 4), "resume 3000 frames back reads the retained frames");
+	CHECK(s->samples_dropped == 0, "no dropout on resume (%lld)", (long long)s->samples_dropped);
+	free(in);
+	free(out);
+	stream_unref(s);
+}
+
+/* Retention never costs room ahead of the reader: played frames give way. */
+static void test_retention_bounded(void)
+{
+	stream_t *s = mk(16, 2, 1000);
+	uint8_t in[400 * 4], out[400 * 4];
+	memset(in, 5, sizeof in);
+	const char *err = NULL;
+	stream_begin_read(s, 0);
+	for (int i = 0; i < 10; i++) {
+		CHECK(stream_write(s, i * 400, 0, 0, in, sizeof in, 400, -1, true, &err) == 0, "write %d", i);
+		stream_read(s, out, 400);
+	}
+	CHECK(s->overrun_count == 0, "sequential write/read never overruns (%lld)", (long long)s->overrun_count);
+	CHECK(s->hi - s->lo <= s->capacity && s->hi == 4000, "window [%lld, %lld) within capacity",
+	      (long long)s->lo, (long long)s->hi);
+	/* ahead of the reader by more than the capacity: refused, not overwritten */
+	stream_write(s, 4000, 0, 0, in, sizeof in, 400, -1, true, &err);
+	stream_write(s, 4400, 0, 0, in, sizeof in, 400, -1, true, &err);
+	stream_write(s, 4800, 0, 0, in, sizeof in, 400, -1, true, &err);
+	CHECK(s->overrun_count > 0 && s->hi <= s->rd + s->capacity, "never more than one capacity past the reader");
+	stream_unref(s);
+}
+
 int main(void)
 {
 	test_chmap0_silence();
@@ -133,6 +178,8 @@ int main(void)
 	test_partial(24, 0x2);
 	test_short_rejected();
 	test_full_unchanged();
+	test_resume_rewind();
+	test_retention_bounded();
 	printf("stream unit tests: %d passed, %d failed\n", passes, fails);
 	return fails ? 1 : 0;
 }

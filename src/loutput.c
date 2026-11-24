@@ -223,7 +223,8 @@ static char *output_info_json(mdev_t *d)
 	cJSON_AddStringToObject(ad, "name", d->pd.name);
 	cJSON_AddStringToObject(ad, "id", d->pd.card_id);
 	cJSON_AddStringToObject(ad, "longname", d->pd.longname);
-	cJSON_AddStringToObject(ad, "components", d->pd.components);
+	/* RoonBridge fills "components" from snd_ctl_card_info_get_id (spec 14.9). */
+	cJSON_AddStringToObject(ad, "components", d->pd.card_id);
 	if (d->pd.usb_id[0])
 		cJSON_AddStringToObject(ad, "usbid", d->pd.usb_id);
 	cJSON_AddStringToObject(ad, "driver", d->pd.driver);

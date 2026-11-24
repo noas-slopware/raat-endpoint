@@ -782,8 +782,9 @@ zone gets no `sync`, the audio command order and chunk size, that no
 `COMMAND_NORMALIZATION` is sent, `CHMAP` -1, how seek, pause and track change map onto
 the primitives, the clock query rate and the reported delay. The list below is kept
 as it was, with what capture3 answered marked **[c3]**; what is not marked is still
-open. Still unseen: format changes, high rates, DSD, grouped zones, a resume within the
-Core's 5 s pause window, and natural (gapless) track ends.
+open. Still unseen: high rates, DSD, grouped zones and natural (gapless) track ends. Format
+changes and a resume within the Core's 5 s pause window were seen later (sections 14.4,
+14.8).
 
 These still need a **playback capture**, in both directions (Core to endpoint *and*
 endpoint to Core), taken while a track plays, seeks, pauses and changes format:
@@ -1379,7 +1380,7 @@ endpoint may do the same.
 - **Pause** = `stop`. After 5.0 s of pause the Core sent `end_stream` and `teardown`
   (both pauses: 15:21:00.527 → 05.528 and 15:21:26.582 → 31.584).
 - **Resume** after that = a full new `setup` (same format), `stream`, `start`. A resume
-  inside the 5 s window, which would `start` again from `STOPPED`, was not captured.
+  inside the 5 s window is a `start` on the same stream from `STOPPED` (section 14.8).
 - **Next track** (same format) = `end_stream`, then 1.35 s later `stream` and `start`.
   No new `setup`. A natural track end (gapless) was not captured. In capture3 that
   stream opened with `CHMAP -1`; in native1 a same-format track change opened with a
@@ -1452,3 +1453,84 @@ tore the session down, and the Core lost the zone. `stream_write` now expands ma
 above, and `src/tests/test_stream.c` plus the native1 replay in `src/tests/replay.py`
 cover it. The replay checks 15000 silent frames at the stream's start frame, then the
 captured payload bit for bit.
+
+### 14.8 Resume inside the pause window
+
+**On the wire** (native1 16:11:49-52 and native3 16:36:33-37, both against this repo's
+endpoint, so only the Core's side is evidence):
+
+| native1 | Core → endpoint | Endpoint → Core |
+|---|---|---|
+| 16:11:42.709 | `start{min_offset, stream_sample:0}` rid 11 | `Playing`, `Success{time:25672038234}` |
+| 16:11:49.088 | `stop` rid 12 | rid 10 `Stopped`, rid 12 `Success` |
+| 16:11:52.625 | `start{min_offset:69181476, stream_sample:278172}` rid 13 | `Playing`, `Success{time}`, then (the bug) `Dropout{1475}`, `Dropout{1764}` |
+
+- No new `stream`, no new audio connection, no `STREAMSAMPLE`: the Core stops sending
+  audio at `stop` and carries on from where it was after the new `start`, on the same
+  connection.
+- **`stream_sample` is the sample that was audible when the Core sent `stop`:**
+  `S0 + (get_local_time at stop - start time) * rate`. From native1's clock readings
+  that is 278174 against the 278172 sent.
+- The reply's `time` is, as for every start, `get_local_time + min_offset` (script).
+- The script does not report `Buffering` or `Ready` again: `STOPPED → PLAYING`.
+
+**What the endpoint has to keep.** When `stop` arrives, the output has already taken
+everything up to the audible sample plus its device queue (about 49 ms on the R26,
+plus the period being written). The resume sample lies that far back. RoonBridge's
+ring (`RAAT__stream_read`, `native/libraatmanager.c:23954`) is a list of the Core's
+packets (15000 frames each here), read by absolute position. A read frees only packets
+that end before the read position, so the packet holding the current position, up to
+340 ms of already-played audio, stays and a resume a few tens of ms back finds its data.
+This repo's first ring advanced its low mark on every read, so the frames between the
+resume sample and the read position were gone. That is the `Dropout` of about one
+device queue (3183 frames on the device in native3; 296 under the 40 ms null output).
+Now played frames stay in the ring until new data needs their space, and writes may
+run at most one capacity past the read position. A resume therefore finds its data for
+any distance back that fits the ring, which is more than RoonBridge's one packet. The
+audio between the resume sample and the stop's effective end is heard twice (it was
+in the device queue), as on RoonBridge.
+
+**rb4** (RoonBridge on the same R26 and Core, 16:37:54-16:38:21) has no resume in the
+window. Nothing was sent at 16:38:04: the Core kept streaming at real-time pace, then at
+16:38:08.523 sent `end_stream` and a new `stream` (`stream_id + 1`, `STREAMSAMPLE 0`)
+with a `start{stream_sample:0}`, as for a seek. The `stop` at 16:38:16.340 was followed
+5 s later by `end_stream` and `teardown`, as in capture3. Its replies match this repo's
+endpoint frame for frame (`src/tests/replay.py`), including the `OutputMessage` (both
+send `{"status":"OutputMessage","message":{"signal_path":[...]}}`), once `components`
+is filled as below.
+
+### 14.9 RoonBridge's ALSA output thread (`FUN_001c31e0`, around line 10550)
+
+- It runs at `SCHED_RR`, priority 95 (`sched_setscheduler(0, 2, 95)`), and logs a
+  failure without stopping.
+- **Delay.** At the top of every loop, before writing the next buffer of one period, it
+  takes `RC__now_ns` and `snd_pcm_delay` and stores
+  `delay = samples_to_ns(snd_pcm_delay + extra) + sync_offset_ns`, where `extra` (offset
+  0x230) is 0 unless set, and `deadline = now + delay`. `get_output_delay` returns that
+  live value. So the delay is the device queue as ALSA reports it, USB in flight
+  included (2165-2170 frames on the R26 with a 1764-frame buffer). The time spent opening
+  and preparing the PCM is not counted. The margin for a start is only the Core's
+  `+ 20 ms` on top of it.
+- **Start.** While the start time lies beyond `deadline + ns_per_buf` it writes silence
+  ("waiting for start time..."). Once it falls inside the next buffer, it pads with
+  `ns_to_samples(start - deadline)` frames of silence. If the start time has *already
+  passed*, it **skips** `ns_to_samples(deadline - start)` stream samples. It does not
+  shift the start and does not correct the reply (the script sent `time` before the
+  output thread saw the start).
+- `alsa_device.components` in `output.info` and in the signal path is filled from
+  `snd_ctl_card_info_get_id`, not `_get_components` (the value read for the key at
+  line 6144 is the id), which is why it reads `"G20"`. This repo's endpoint copies that.
+- The x64 1.1.48 bridges on the LAN (seen answering SOOD in rb4) advertise
+  `code_signing_keys:"Roon"`, the key *name*.
+
+**This repo's endpoint, after the late-start reports on the device** ("start time is
+345 frames late" right after an ALSA reopen): the reported delay averaged the queue
+after each write and began at the bare buffer size. The first readings after a reopen
+do not yet include USB in flight, so it reported about 9 ms too little and the Core's
+`delay + 20 ms` start could land late. Now the delay is a decaying maximum of the
+post-write queue, never below the last reading, starting at buffer + period. A start
+that is still late does **not** skip samples, unlike RoonBridge. The stream starts at
+the next device frame, late by that much, and the warning is logged. Nothing is
+dropped, at the cost of the Core's position bookkeeping being off by those frames, which
+on a later resume in the window means repeating them. The output thread also asks for
+`SCHED_RR` 95.

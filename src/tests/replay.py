@@ -56,6 +56,7 @@ CAP2 = os.path.join(CAPDIR, 'capture2', 'raat.pcap')
 CAP3 = os.path.join(CAPDIR, 'capture3', 'raat.pcap')
 CAP3_HW = os.path.join(CAPDIR, 'capture3', 'hw_params.txt')
 NATIVE1 = os.path.join(CAPDIR, 'native1', 'raat.pcap')
+RB4 = os.path.join(CAPDIR, 'rb4', 'raat.pcap')
 
 LL_REQUEST, LL_RESPONSE, LL_KEEPALIVE, LL_BEGIN_KA = 0x80000001, 0x80000002, 0x80000003, 0x80000004
 SERVICE_ID = 'd7634b85-8190-470f-aa51-6cb5538dc1b9'
@@ -432,13 +433,18 @@ def run(proc, mport, sport, mgr_in, exp_mgr, dev_in, exp_dev, exp_info, scripts,
     check(f is not None and f != 'EOF' and f[0] == LL_KEEPALIVE, 'manager sends 0x80000003 after LL_BEGIN_KEEPALIVE')
 
     if os.path.exists(CAP3):
-        replay3(dc, sink)
+        replay_capture(dc, sink, CAP3, 'capture3', first=True)
     else:
         print(f'== playback replay skipped: {CAP3} not found')
+    if os.path.exists(RB4):
+        replay_capture(dc, sink, RB4, 'rb4', resume=True)
+    else:
+        print(f'== RoonBridge replay skipped: {RB4} not found')
     if os.path.exists(NATIVE1):
         native1_replay(dc, sink)
     else:
         print(f'== same-format track change skipped: {NATIVE1} not found')
+    late_start(dc, sink)
     synthetic(dc, mc, exp_info)
     sood_test(sport, mport)
     api_audit(binary, qemu, scripts)
@@ -493,9 +499,15 @@ def widen16(pcm):
     return bytes(out)
 
 
-def replay3(dc, sink):
-    print('== playback replay (capture3 Core->endpoint, shortened waits -> capture3 replies)')
-    st = capture.tcp_streams(CAP3)
+def replay_capture(dc, sink, path, label, first=False, resume=False):
+    """Replay one playback capture's session requests and audio connections.
+
+    first: this is the first setup of the process (clock base 0), so absolute
+    clock checks apply. resume: right after the capture's last stop, insert a
+    resume inside the Core's 5 s window (start at the sample that was audible
+    when the stop came, as the Core computes it) and a stop, then go on."""
+    print(f'== playback replay ({label} Core->endpoint, shortened waits -> {label} replies)')
+    st = capture.tcp_streams(path)
     sess_in = None
     for k, s in st.items():
         frames, _ = capture.ll_frames(s)
@@ -503,7 +515,7 @@ def replay3(dc, sink):
         if any(r[1].get('request') == 'setup' for r in reqs):
             sess_in = (k, reqs)
     if not sess_in:
-        check(False, 'capture3: session connection found')
+        check(False, f'{label}: session connection found')
         return
     k_in, reqs = sess_in
     out = st[(k_in[2], k_in[3], k_in[0], k_in[1])]
@@ -518,7 +530,19 @@ def replay3(dc, sink):
             exp.append((rid, fin, json.loads(b[5:])))
     cap_audio_port = next(e[2]['audio_port_tcp'] for e in exp if e[0] != 'LOST' and 'audio_port_tcp' in e[2])
     audio = sorted((s for k, s in st.items() if k[3] == cap_audio_port), key=lambda s: s.t0)
-    print(f'  capture3: {len(reqs)} session requests, {len(audio)} audio connections, '
+    # Requests the capture lost: a missing rid whose reply carries `time` was a
+    # start. Rebuild it the way the Core sends starts (stream_sample 0;
+    # min_offset is recomputed below anyway).
+    have = {struct.unpack('>i', rw[:4])[0] for _, _, rw in reqs}
+    for missing in sorted(set(range(min(have), max(have) + 1)) - have):
+        if any(e[0] == missing and 'time' in e[2] for e in exp if e[0] != 'LOST'):
+            body = {'request': 'start', 'min_offset': 0, 'stream_sample': 0}
+            prev = max(i for i, (_, _, rw) in enumerate(reqs) if struct.unpack('>i', rw[:4])[0] < missing)
+            reqs.insert(prev + 1, (reqs[prev][0], body, struct.pack('>i', missing) + json.dumps(body).encode()))
+            print(f'  {label}: rebuilt lost request {missing} (start)')
+        else:
+            check(False, f'{label}: request {missing} lost and not rebuildable')
+    print(f'  {label}: {len(reqs)} session requests, {len(audio)} audio connections, '
           f'{len([e for e in exp if e[0] != "LOST"])} replies, {sum(n for _, n in lost)} reply bytes lost by the capture')
 
     got = []
@@ -531,6 +555,9 @@ def replay3(dc, sink):
     cur_stream = None
     last_before_teardown = None
     first_after_setup = []
+    sink_of = {}         # setup index -> its output dump
+    resumes = []         # (setup index, stream index, N, resumed start time, first start time)
+    last_stop = max(i for i, (_, r2, _) in enumerate(reqs) if r2['request'] == 'stop') if resume else None
 
     def collect(until, timeout=5.0):
         while True:
@@ -548,14 +575,17 @@ def replay3(dc, sink):
             if setup_n:
                 time.sleep(0.5)  # capture3: 1 s between teardown and the next setup
             setup_n += 1
+            before = set(os.listdir(sink))
             dc.session(1, raw)
             f = collect(lambda f: f[0] == rid and (f[1] == 1 or f[2].get('status') == 'Success'))
             if not f or f[2].get('status') != 'Success':
-                check(False, 'capture3: setup succeeded', repr(f))
+                check(False, f'{label}: setup succeeded', repr(f))
                 return
             clk = clk or Clock(f[2]['clock_port'])
             clk.port = f[2]['clock_port']
             audio_port = f[2]['audio_port_tcp']
+            new = sorted(set(os.listdir(sink)) - before)
+            sink_of[setup_n] = os.path.join(sink, new[-1]) if new else None
             first_after_setup.append(clk.burst())
         elif name == 'stream':
             dc.session(1, raw)
@@ -571,8 +601,9 @@ def replay3(dc, sink):
             c = clk.burst()
             body = dict(req)
             body['min_offset'] = c[2] + 20000000  # the Core: last delay + 20 ms
-            check(req['min_offset'] - 20000000 > 40000000, f'capture3: start min_offset {req["min_offset"]} '
-                  '= captured delay + 20 ms (R26 delay ~49 ms)')
+            if req['min_offset']:
+                check(req['min_offset'] - 20000000 > 40000000, f'{label}: start min_offset {req["min_offset"]} '
+                      '= captured delay + 20 ms (R26 delay ~49 ms)')
             w = time.monotonic_ns()
             dc.session(1, raw[:4] + json.dumps(body).encode())
             f = collect(lambda f: f[0] == rid and f[1] == 1)
@@ -584,8 +615,25 @@ def replay3(dc, sink):
             time.sleep(0.8)  # play a little; the capture played for seconds
             clk.burst()
         elif name in ('stop', 'end_stream'):
+            at_stop = clk.burst(1) if name == 'stop' else None
             dc.session(1, raw)
             collect(lambda f: f[0] == rid and f[1] == 1)
+            if name == 'stop' and i == last_stop:
+                # Resume inside the window. The Core restarts the same stream at
+                # the sample that was audible when it sent stop: in native1,
+                # stream_sample 278172 = S0 + (local time at stop - start time)
+                # * rate (278174 from its RAATCLKR readings).
+                s_time, s_si = starts[-1][2], starts[-1][3]
+                n_res = round((at_stop[1] - s_time) * 44100 / 1e9)
+                time.sleep(1.0)
+                c = clk.burst()
+                sess_req(dc, 900, {'request': 'start', 'min_offset': c[2] + 20000000, 'stream_sample': n_res})
+                f = collect(lambda f: f[0] == 900 and f[1] == 1)
+                if f and isinstance(f[2].get('time'), int):
+                    resumes.append((setup_n, s_si, n_res, f[2]['time'], s_time))
+                time.sleep(0.8)
+                sess_req(dc, 901, {'request': 'stop'})
+                collect(lambda f: f[0] == 901 and f[1] == 1)
             if name == 'end_stream' and asock:
                 asock.close()
                 asock = None
@@ -599,11 +647,24 @@ def replay3(dc, sink):
             dc.session(1, raw)
             collect(lambda f: f[0] == setup_rid and f[1] == 1)
         else:
-            check(False, f'capture3: unexpected request {name}')
+            check(False, f'{label}: unexpected request {name}')
 
     # ---- replies: same sequence; lost capture bytes must equal ours there
     ok, gi, detail = True, 0, ''
     allowed = {'.message.signal_path[0].method', '.message.signal_path[0].alsa_device.longname'}
+    if resume:
+        res = [g for g in got if g[0] != 'NONE' and g[0] in (900, 901)]
+        sts = [g[2]['status'] for g in res]
+        check(sts == ['Success', 'Success'], f'{label}: resume in window: start and stop answered Success',
+              repr(sts))
+        # Drop the inserted cycle (its replies and the stream context's
+        # Playing/Stopped between the captured stop and end_stream).
+        cut = [i for i, g in enumerate(got) if g[0] in (900, 901)]
+        if cut:
+            got = [g for i, g in enumerate(got) if not (cut[0] - 1 <= i <= cut[-1] and g[0] != 'NONE' and
+                                                         (g[0] in (900, 901) or
+                                                          g[2].get('status') in ('Playing', 'Stopped')))
+                   or i == cut[0] - 1 and g[2].get('status') != 'Playing']
     for j, e in enumerate(exp):
         if e[0] == 'LOST':
             nxt = next((x for x in exp[j + 1:] if x[0] != 'LOST'), None)
@@ -627,15 +688,16 @@ def replay3(dc, sink):
             ok, detail = False, f'reply {j}: got {g[:3]} expected {e} {d}'
             break
     extra = [g for g in got[gi:] if g[0] != 'NONE']
-    check(ok and not extra, f'capture3: {len(exp)} replies match in order (rid, final, body modulo ports/time; '
+    check(ok and not extra, f'{label}: {len(exp)} replies match in order (rid, final, body modulo ports/time; '
           'lost capture bytes = our frames there)', detail or repr(extra[:3]))
     check(not any(g[0] != 'NONE' and g[2].get('status') == 'Dropout' for g in got),
-          'capture3: no Dropout (none in the capture either)')
+          f'{label}: no Dropout (none in the capture either)' + (', resume in window included' if resume else ''))
 
     # ---- clock behaviour seen in capture3
     s = clk.samples
-    check(first_after_setup[0] and first_after_setup[0][1] < 500e6,
-          f'clock starts near 0 at the first setup ({first_after_setup[0][1] / 1e6:.1f} ms)')
+    if first:
+        check(first_after_setup[0] and first_after_setup[0][1] < 500e6,
+              f'clock starts near 0 at the first setup ({first_after_setup[0][1] / 1e6:.1f} ms)')
     if last_before_teardown and len(first_after_setup) > 1 and first_after_setup[1]:
         a, b = last_before_teardown, first_after_setup[1]
         dl, dw = b[1] - a[1], b[0] - a[0]
@@ -653,8 +715,8 @@ def replay3(dc, sink):
     sinks = {}
     for n in sorted({x[0] for x in starts}):
         try:
-            sinks[n] = open(os.path.join(sink, f'sink-{n}.raw'), 'rb').read()
-        except OSError:
+            sinks[n] = open(sink_of[n], 'rb').read()
+        except (OSError, TypeError, KeyError):
             sinks[n] = b''
     pos = {}
     for setup_i, rid, t_start, si in starts:
@@ -688,10 +750,26 @@ def replay3(dc, sink):
                        default=0)
         check(not any(before[prev_end * bpf:]), f'start rid {rid}: only silence before the stream begins')
         pos[rid] = (setup_i, f0, t_start, lo)
-    if 8 in pos and pos[8][0] == 1:
-        k = pos[8][1]
-        want = -(-pos[8][2] * rate_hz // 1000000000)
+    first_rid = starts[0][1] if starts else None
+    if first and first_rid in pos and pos[first_rid][0] == 1:
+        k = pos[first_rid][1]
+        want = -(-pos[first_rid][2] * rate_hz // 1000000000)
         check(abs(k - want) <= 1, f'first stream starts at device frame {k} = ceil(time * rate) = {want}')
+    for setup_i, si, n_res, t_res, t_first in resumes:
+        q = next((q for q in pos.values() if q[0] == setup_i and q[2] == t_first), None)
+        if not q:
+            check(False, f'{label}: resumed stream located in the output dump')
+            continue
+        p_res = q[1] + round((t_res - t_first) * rate_hz / 1e9)
+        exp_bytes = widen16(stream_pcm[si])
+        m = rate_hz // 2
+        want = exp_bytes[n_res * bpf:(n_res + m) * bpf]
+        # both start frames are ceil()s of their times, so the difference may be off by one
+        ok = any(sinks[setup_i][p * bpf:(p + m) * bpf] == want for p in (p_res - 1, p_res, p_res + 1))
+        found = sinks[setup_i].find(exp_bytes[n_res * bpf:n_res * bpf + 8192])
+        check(ok,
+              f'{label}: resume plays stream sample {n_res} on at its start time, {m} frames bit-exact '
+              '(played frames stay in the ring)', f'expected at frame {p_res}, found at {found / bpf}')
     same = [(r, q) for r, q in sorted(pos.items())]
     for (r1, q1), (r2, q2) in zip(same, same[1:]):
         if q1[0] == q2[0]:
@@ -805,6 +883,45 @@ def native1_replay(dc, sink):
     n = len(captured_b) // 4
     check(data[pb_data * bpf:(pb_data + n) * bpf] == eb[:n * bpf],
           f'native1: then all {n} captured frames bit-exact (16-bit widened to S32_LE)')
+
+
+def late_start(dc, sink):
+    """A start whose time has already passed: nothing may be dropped.
+
+    RoonBridge skips the samples it is late for (spec 14.9). Here the stream
+    starts at the next device frame instead, from its first sample."""
+    print('== late start (min_offset far below the reported delay)')
+    fmt = {'sample_type': 'pcm', 'sample_rate': 44100, 'bits_per_sample': 16, 'channels': 2,
+           'sample_subtype': 'none'}
+    before = set(os.listdir(sink))
+    sess_req(dc, 400, {'request': 'setup', 'format': fmt})
+    f1, f2 = read_sess(dc), read_sess(dc)
+    aport = f2[2]['audio_port_tcp']
+    new = sorted(set(os.listdir(sink)) - before)
+    sess_req(dc, 401, {'request': 'stream', 'stream_id': 77, 'first_seq': -1, 'nak_port': -1,
+                       'buffer_size': 10, 'ready_threshold': 0.2})
+    until_rid(dc, 401)
+    n = 15000
+    pcm = bytes(((i * 7) & 0xff) | 1 for i in range(n * 4 * 7))  # no zero byte: any skip shows
+    a = socket.create_connection(('127.0.0.1', aport), timeout=5)
+    a.sendall(bytes([2]) + struct.pack('>i', 77) + bytes([3]) + struct.pack('>q', 0) + bytes([1]) +
+              struct.pack('>i', -1) + b''.join(bytes([0]) + struct.pack('>ii', n, n * 4) + pcm[i * n * 4:(i + 1) * n * 4]
+                                                for i in range(7)))
+    until_rid(dc, 401)  # Ready
+    sess_req(dc, 402, {'request': 'start', 'min_offset': 1000000, 'stream_sample': 0})  # 1 ms
+    until_rid(dc, 402)
+    time.sleep(0.6)
+    sess_req(dc, 403, {'request': 'end_stream'})
+    until_rid(dc, 403)
+    sess_req(dc, 404, {'request': 'teardown'})
+    until_rid(dc, 400)
+    a.close()
+    data = open(os.path.join(sink, new[-1]), 'rb').read() if new else b''
+    e = widen16(pcm)
+    p = data.find(e[:8192])
+    check(p >= 0 and p % 8 == 0 and data[p:p + 22050 * 8] == e[:22050 * 8],
+          'late start: the stream plays from its first sample, nothing skipped')
+    check(not any(data[:max(p, 0)]), 'late start: only silence before it')
 
 
 def synthetic(dc, mc, exp_info):

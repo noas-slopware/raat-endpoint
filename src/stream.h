@@ -18,9 +18,10 @@ typedef struct stream {
 	uint8_t *data;
 
 	bool empty;
-	int64_t lo, hi; /* valid absolute samples are [lo, hi) */
+	int64_t lo, hi; /* retained absolute samples are [lo, hi), hi - lo <= capacity */
 	bool reading;
-	int64_t rd; /* next sample the reader takes */
+	bool has_read; /* rd is meaningful (reading now, or stopped after reading) */
+	int64_t rd;    /* next sample the reader takes */
 
 	double gain, peak; /* last per-packet normalization (metadata only) */
 	int32_t chmap;

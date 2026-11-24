@@ -133,10 +133,10 @@ static int write_frames(stream_t *s, int64_t sample, double gain, double peak, c
 	if (has_chmap)
 		s->chmap = chmap;
 	if (s->empty) {
-		s->lo = s->hi = s->reading && s->rd > sample ? s->rd : sample;
+		s->lo = s->hi = s->has_read && s->rd > sample ? s->rd : sample;
 		s->empty = false;
 	}
-	/* Late data (before the window) is dropped. */
+	/* Data older than the retained window is dropped. */
 	if (sample < s->lo) {
 		int64_t skip = s->lo - sample;
 		if (skip >= n) {
@@ -147,31 +147,35 @@ static int write_frames(stream_t *s, int64_t sample, double gain, double peak, c
 		n -= skip;
 		sample = s->lo;
 	}
-	/* A gap ahead of the window is filled with silence. */
+	/* Played frames stay in the ring until new data needs their space, so a
+	 * start after a stop can go back to the sample that was audible when the
+	 * stop came (spec 14.8). Only what the reader has not reached yet is
+	 * protected: writes may not run more than one capacity past it. */
+	int64_t base = s->has_read ? s->rd : s->lo;
 	if (sample > s->hi) {
-		int64_t gap = sample - s->hi;
-		if (sample + n - s->lo > s->capacity) {
+		if (sample + n - base > s->capacity) {
 			s->overrun_count++;
 			s->samples_overrun += n;
 			pthread_mutex_unlock(&s->mu);
 			LOGW("[stream] ring full, %lld samples thrown away", (long long)n);
 			return 0;
 		}
-		ring_zero(s, s->hi, gap);
+		ring_zero(s, s->hi, sample - s->hi); /* a gap ahead becomes silence */
 		s->hi = sample;
 	}
-	/* Never overwrite what the reader has not consumed. */
-	int64_t room = s->lo + s->capacity - sample;
+	int64_t room = base + s->capacity - sample;
 	if (n > room) {
 		s->overrun_count++;
-		s->samples_overrun += n - room;
-		LOGW("[stream] ring full, %lld samples thrown away", (long long)(n - room));
-		n = room;
+		s->samples_overrun += n - (room > 0 ? room : 0);
+		LOGW("[stream] ring full, %lld samples thrown away", (long long)(n - (room > 0 ? room : 0)));
+		n = room > 0 ? room : 0;
 	}
 	if (n > 0) {
 		ring_put(s, sample, data, n);
 		if (sample + n > s->hi)
 			s->hi = sample + n;
+		if (s->hi - s->lo > s->capacity)
+			s->lo = s->hi - s->capacity; /* oldest played frames give way */
 	}
 	pthread_mutex_unlock(&s->mu);
 	return 0;
@@ -181,7 +185,7 @@ void stream_clear(stream_t *s)
 {
 	pthread_mutex_lock(&s->mu);
 	s->empty = true;
-	s->lo = s->hi = s->reading ? s->rd : 0;
+	s->lo = s->hi = s->has_read ? s->rd : 0;
 	pthread_mutex_unlock(&s->mu);
 }
 
@@ -189,16 +193,10 @@ void stream_begin_read(stream_t *s, int64_t sample)
 {
 	pthread_mutex_lock(&s->mu);
 	s->reading = true;
+	s->has_read = true;
 	s->rd = sample;
-	if (s->empty) {
+	if (s->empty)
 		s->lo = s->hi = sample;
-	} else if (sample > s->lo) {
-		s->lo = sample < s->hi ? sample : s->hi;
-		if (sample > s->hi) {
-			s->lo = s->hi = sample;
-			s->empty = true;
-		}
-	}
 	pthread_mutex_unlock(&s->mu);
 }
 
@@ -224,14 +222,7 @@ void stream_read(stream_t *s, uint8_t *dst, int64_t n)
 		s->samples_dropped += n - got;
 	}
 	s->samples_out += got;
-	s->rd += n;
-	if (!s->empty) {
-		if (s->rd >= s->hi) {
-			s->lo = s->hi = s->rd;
-		} else if (s->rd > s->lo) {
-			s->lo = s->rd;
-		}
-	}
+	s->rd += n; /* the frames stay retained; see stream_write */
 	pthread_mutex_unlock(&s->mu);
 	if (got < n)
 		LOGT("[stream] short by %lld samples, padded with silence", (long long)(n - got));

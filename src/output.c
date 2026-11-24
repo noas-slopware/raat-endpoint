@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -332,18 +333,31 @@ static void clock_update(output_t *o, int64_t pos)
 		 * clock smooth at that resolution. */
 		o->off += (meas - o->off) / 16.0;
 	}
+	/* Reported delay: a decaying maximum of the queue right after a write,
+	 * never below what was just measured. Starting from buffer + period, it
+	 * is at least the real queue from the first query after setup on, when
+	 * USB in flight is not yet visible in the first readings. An average
+	 * here let starts land a few ms late right after an ALSA reopen. */
 	double q = (double)(o->written - pos);
 	if (!o->q_valid) {
-		o->qdelay = q;
+		o->qdelay = (double)(o->bufsize + o->period);
 		o->q_valid = true;
-	} else {
-		o->qdelay += (q - o->qdelay) / 16.0;
 	}
+	if (q > o->qdelay)
+		o->qdelay = q;
+	else
+		o->qdelay += (q - o->qdelay) / 256.0;
 }
 
 static void *output_thread(void *arg)
 {
 	output_t *o = arg;
+	/* RoonBridge runs its ALSA thread SCHED_RR at priority 95 (spec 14.9). Needs
+	 * CAP_SYS_NICE; without it the thread stays SCHED_OTHER. */
+	struct sched_param sp = { .sched_priority = 95 };
+	int se = pthread_setschedparam(pthread_self(), SCHED_RR, &sp);
+	if (se)
+		LOGI("[output] no real-time priority for the output thread: %s", strerror(se));
 	for (;;) {
 		pthread_mutex_lock(&o->mu);
 		if (o->quit) {
@@ -354,9 +368,11 @@ static void *output_thread(void *arg)
 			int64_t k = (int64_t)ceil((double)(o->start_time - o->L0) / o->nspf);
 			int64_t s0 = o->start_sample;
 			if (k < o->written) {
-				LOGW("[output] start time is %lld frames late; skipping them",
-				     (long long)(o->written - k));
-				s0 += o->written - k;
+				/* Too late for the requested instant. RoonBridge skips the
+				 * missed samples (spec 14.9); here nothing is dropped: the
+				 * stream starts at the next frame, late by that much. */
+				LOGW("[output] start time is %lld frames late; starting late instead of "
+				     "dropping them", (long long)(o->written - k));
 				k = o->written;
 			}
 			LOGI("[output] stream begins at device frame %lld (written so far %lld), first sample %lld",
@@ -588,7 +604,7 @@ int64_t output_delay_ns(output_t *o)
 	 * reported 49.09-49.21 ms for a 40 ms ALSA buffer (USB in flight on top),
 	 * steady from setup on, and the Core set min_offset = delay + 20 ms. */
 	pthread_mutex_lock(&o->mu);
-	double q = o->q_valid ? o->qdelay : (double)o->bufsize;
+	double q = o->q_valid ? o->qdelay : (double)(o->bufsize + o->period);
 	pthread_mutex_unlock(&o->mu);
 	return (int64_t)llround(q * o->nspf) + g_extra_delay_ns;
 }
@@ -634,7 +650,8 @@ char *output_signal_path_json(output_t *o)
 	cJSON_AddStringToObject(ad, "name", o->pd.name);
 	cJSON_AddStringToObject(ad, "id", o->pd.card_id);
 	cJSON_AddStringToObject(ad, "longname", o->pd.longname);
-	cJSON_AddStringToObject(ad, "components", o->pd.components);
+	/* RoonBridge fills "components" from snd_ctl_card_info_get_id (spec 14.9). */
+	cJSON_AddStringToObject(ad, "components", o->pd.card_id);
 	if (o->pd.usb_id[0])
 		cJSON_AddStringToObject(ad, "usbid", o->pd.usb_id);
 	cJSON_AddStringToObject(ad, "driver", o->pd.driver);
