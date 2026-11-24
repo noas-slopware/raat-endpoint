@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #define SOOD_GROUP "239.255.90.90"
+#define SOOD_DEFAULT_PORT 9003
 #define MAX_KV 32
 #define DEDUP 32
 
@@ -154,6 +155,45 @@ static void handle_packet(const uint8_t *p, size_t n, const struct sockaddr_in *
 		LOGD("[sood] answered query from %s:%d", ip, ntohs(to.sin_port));
 }
 
+/*
+ * Unsolicited announce, as RoonBridge's manager does when it starts and when
+ * the network interfaces change ("[raatmanager] announcing"): a 'Q' packet
+ * with the info dictionary and a fresh _tid, multicast to the SOOD group on
+ * every IPv4 interface. A Core that has stopped retrying an endpoint (for
+ * example after it vanished without closing its connections) finds it again
+ * through this; answering queries alone is not enough.
+ */
+static void announce(void)
+{
+	uint8_t out[1400];
+	char tid[37];
+	guid_new(tid);
+	seen_tid(tid); /* our own packet may come back: don't answer it */
+	memcpy(out, "SOOD\x02Q", 6);
+	size_t o = put_kv(out, 6, sizeof out, "_tid", tid);
+	for (int i = 0; i < S.nkv; i++)
+		o = put_kv(out, o, sizeof out, S.keys[i], S.vals[i]);
+
+	struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(SOOD_DEFAULT_PORT) };
+	inet_pton(AF_INET, SOOD_GROUP, &to.sin_addr);
+	struct ifaddrs *ifa, *i;
+	if (getifaddrs(&ifa) < 0)
+		return;
+	for (i = ifa; i; i = i->ifa_next) {
+		if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET || !(i->ifa_flags & IFF_UP) ||
+		    !(i->ifa_flags & IFF_MULTICAST) || (i->ifa_flags & IFF_LOOPBACK))
+			continue;
+		struct in_addr ifaddr = ((struct sockaddr_in *)i->ifa_addr)->sin_addr;
+		if (setsockopt(S.w.fd, IPPROTO_IP, IP_MULTICAST_IF, &ifaddr, sizeof ifaddr) < 0)
+			continue;
+		if (sendto(S.w.fd, out, o, 0, (struct sockaddr *)&to, sizeof to) < 0)
+			LOGW("[sood] announce on %s: %s", i->ifa_name, strerror(errno));
+		else
+			LOGI("[sood] announced on %s", i->ifa_name);
+	}
+	freeifaddrs(ifa);
+}
+
 static void sood_io(io_watch_t *w, uint32_t ev)
 {
 	(void)ev;
@@ -175,8 +215,10 @@ static void netlink_io(io_watch_t *w, uint32_t ev)
 	bool changed = false;
 	while (recv(w->fd, buf, sizeof buf, 0) > 0)
 		changed = true;
-	if (changed)
+	if (changed) {
 		join_all();
+		announce();
+	}
 }
 
 int sood_start(const char *bind_addr, int port, bool join_multicast, const struct sood_kv *kv)
@@ -211,6 +253,11 @@ int sood_start(const char *bind_addr, int port, bool join_multicast, const struc
 	}
 	LOGI("[sood] listening on udp %s:%d%s", bind_addr, S.port,
 	     join_multicast ? " (multicast " SOOD_GROUP ")" : "");
+	if (join_multicast) {
+		unsigned char off = 0;
+		setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &off, sizeof off);
+		announce();
+	}
 	return 0;
 }
 

@@ -1,5 +1,6 @@
-/* SOOD discovery responder (spec 4): answers 'Q' queries for the RAAT
- * service id with a unicast 'R'. It never sends anything unsolicited. */
+/* SOOD discovery (spec 4): answers 'Q' queries for the RAAT service id with a
+ * unicast 'R', and announces itself with a multicast 'Q' at start and when the
+ * interface addresses change (with multicast enabled only). */
 #ifndef RAAT_SOOD_H
 #define RAAT_SOOD_H
 

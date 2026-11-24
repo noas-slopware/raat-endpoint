@@ -57,7 +57,35 @@ static void on_signal(io_watch_t *w, uint32_t ev)
 	loop_stop();
 }
 
-static void machine_id(char out[37], const char *fallback)
+/*
+ * machine_id is part of the endpoint's identity for the Core, like unique_id:
+ * the Core ties the RAAT server (and so its enabled devices) to the pair.
+ * Persist it in <data-dir>/Settings/machine_id; when taking over from
+ * RoonBridge, seed that file with RoonBridge's value (its RAATServer log
+ * prints it), or the Core sees a new machine and leaves the device disabled.
+ */
+static void machine_id_derive(char out[37], const char *fallback);
+
+static void machine_id(char out[37], const char *data_dir, const char *fallback)
+{
+	char path[1100];
+	snprintf(path, sizeof path, "%s/Settings/machine_id", data_dir);
+	char *m = file_read(path, NULL);
+	if (m) {
+		str_rtrim(m);
+		if (strlen(m) == 36) {
+			strlcpy0(out, m, 37);
+			free(m);
+			return;
+		}
+		free(m);
+	}
+	machine_id_derive(out, fallback);
+	if (file_write(path, out, 36) < 0)
+		LOGW("cannot persist machine_id: %s", strerror(errno));
+}
+
+static void machine_id_derive(char out[37], const char *fallback)
 {
 	char *m = file_read("/etc/machine-id", NULL);
 	if (m) {
@@ -209,7 +237,7 @@ int main(int argc, char **argv)
 		const struct platform_uname *u = platform_uname();
 		char osv[160], mid[37], tcp_port[16];
 		snprintf(osv, sizeof osv, "%s %s", u->sysname, u->release);
-		machine_id(mid, manager_unique_id());
+		machine_id(mid, data_dir, manager_unique_id());
 		snprintf(tcp_port, sizeof tcp_port, "%d", manager_port());
 		/* spec 4, 11.2; no code_signing_keys (spec 13.2) */
 		struct sood_kv kv[] = {
@@ -219,14 +247,21 @@ int main(int argc, char **argv)
 			{ "machine_id", mid },
 			{ "machine_name", host },
 			{ "os_version", osv },
-			{ "vendor", vendor },
-			{ "model", model },
+			/* vendor/model: left out when unset, as RoonBridge does */
+			{ vendor ? "vendor" : NULL, vendor },
+			{ model ? "model" : NULL, model },
 			{ "raat_version", raat_version },
 			{ "protocol_version", "1" },
 			{ "config_version", "1" },
 			{ "is_dev", "0" },
 			{ NULL, NULL },
 		};
+		/* drop the unset entries (sood_start stops at the first NULL key) */
+		size_t nk = 0;
+		for (size_t i = 0; i < sizeof kv / sizeof kv[0] - 1; i++)
+			if (kv[i].key)
+				kv[nk++] = kv[i];
+		kv[nk] = (struct sood_kv){ NULL, NULL };
 		if (sood_start(bind_addr, sport, !no_mcast, kv) < 0)
 			LOGW("[sood] discovery disabled");
 	}
