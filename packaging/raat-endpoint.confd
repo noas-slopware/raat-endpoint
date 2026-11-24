@@ -1,0 +1,6 @@
+# the ALSA thread runs SCHED_RR 95
+rc_ulimit="-r 95"
+# 64 MiB, as MemoryMax=64M in the systemd unit (cgroup v2)
+rc_cgroup_settings="
+memory.max 67108864
+"
