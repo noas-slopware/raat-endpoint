@@ -4,7 +4,8 @@
 #   make test       replay test against the host build (needs the captures)
 #   make test-armhf the same test, armhf binary under qemu-arm
 
-TOOLCHAIN ?= /home/yuifunami/r26-mainline/toolchains/gcc-arm-8.2-2018.08-x86_64-arm-linux-gnueabihf/bin
+# directory holding arm-linux-gnueabihf-gcc (e.g. Arm GNU 8.2-2018.08)
+TOOLCHAIN ?= $(dir $(shell command -v arm-linux-gnueabihf-gcc 2>/dev/null))
 TARGET ?= host
 BUILD := build/$(TARGET)
 

@@ -43,7 +43,10 @@ import ll_decode  # noqa: E402
 sys.path.insert(0, HERE)
 import capture  # noqa: E402
 
-CAPDIR = os.environ.get('RAAT_CAPTURE_DIR', '/home/yuifunami/r26-mainline/raat')
+# captures are private and live outside the repo: RAAT_CAPTURE_DIR/capture{,2,3}/raat.pcap
+CAPDIR = os.environ.get('RAAT_CAPTURE_DIR')
+if not CAPDIR:
+    sys.exit('replay.py: set RAAT_CAPTURE_DIR to the directory holding capture/, capture2/, capture3/')
 CAP1 = os.path.join(CAPDIR, 'capture', 'raat.pcap')
 CAP2 = os.path.join(CAPDIR, 'capture2', 'raat.pcap')
 CAP3 = os.path.join(CAPDIR, 'capture3', 'raat.pcap')
