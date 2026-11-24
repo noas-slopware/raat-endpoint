@@ -39,7 +39,12 @@ CJSON_SRCS := third_party/cjson/cJSON.c
 OBJS := $(SRCS:%.c=$(BUILD)/%.o) $(LUA_SRCS:%.c=$(BUILD)/%.o) $(CJSON_SRCS:%.c=$(BUILD)/%.o)
 BIN := $(BUILD)/raat-endpoint
 
-all: $(BIN)
+UNIT := $(BUILD)/test_stream
+
+all: $(BIN) $(UNIT)
+
+$(UNIT): tests/test_stream.c $(BUILD)/stream.o $(BUILD)/util.o $(BUILD)/third_party/cjson/cJSON.o
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(BIN): $(OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
@@ -64,9 +69,11 @@ armhf: build/armhf-deps/lib/libasound.a
 	$(MAKE) TARGET=armhf
 
 test: all
+	build/host/test_stream
 	python3 tests/replay.py build/host/raat-endpoint
 
 test-armhf: armhf
+	qemu-arm build/armhf/test_stream
 	python3 tests/replay.py --qemu qemu-arm build/armhf/raat-endpoint
 
 clean:

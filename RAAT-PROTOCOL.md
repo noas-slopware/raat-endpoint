@@ -1122,7 +1122,7 @@ endpoint (`:289-298`). Which combination the Core uses needs the playback captur
 | cmd | Name | Header | Payload / effect |
 |---|---|---|---|
 | 0 | DATA | `int32 nsamples`, `int32 nbytes` | `nbytes` of audio for `nsamples` frames, starting at the current `streamsample`. Written with `stream:write_chmap(streamsample, gain, peak, buf, nsamples, chmap)` (or `write` without chmap). Afterwards `streamsample += nsamples`. |
-| 1 | CHMAP | `int32 chmap` | Sets the channel map used by subsequent writes. |
+| 1 | CHMAP | `int32 chmap` | Sets the channel map used by subsequent writes: a bitmask of the channels present in each frame of the payload (section 14.7). -1 = all channels, full frames. |
 | 2 | STREAMID | `int32 stream_id` | DATA for a different `stream_id` than the current `stream` request is ignored. |
 | 3 | STREAMSAMPLE | `int64 sample` | Sets the absolute stream position of the next DATA. |
 | 4 | NORMALIZATION | `float64 gain`, `float64 peak` | Metadata for subsequent writes. |
@@ -1381,7 +1381,12 @@ endpoint may do the same.
 - **Resume** after that = a full new `setup` (same format), `stream`, `start`. A resume
   inside the 5 s window, which would `start` again from `STOPPED`, was not captured.
 - **Next track** (same format) = `end_stream`, then 1.35 s later `stream` and `start`.
-  No new `setup`. A natural track end (gapless) and a format change were not captured.
+  No new `setup`. A natural track end (gapless) was not captured. In capture3 that
+  stream opened with `CHMAP -1`; in native1 a same-format track change opened with a
+  silence lead-in instead (section 14.7).
+- **Format change** (native1, a capture against this repo's endpoint, so only its
+  Core-to-endpoint side is evidence) = `end_stream`, then `teardown` and `setup` with
+  the new format in the same millisecond, then `stream` and `start`.
 - Each stream counts its samples from 0; `first_seq` is -1 throughout.
 
 ### 14.5 Clock exchange
@@ -1413,7 +1418,37 @@ the full request when it fits a byte budget and never below `0.3 * request`
 two periods. 16-bit may go into `S32_LE`. `get_output_delay` is the device queue right
 after a write. The clock starts at 0 and carries across setups. The signal path is sent
 before `on_setup`, and `sample_subtype` other than `"none"` is refused. `set_remote_time`
-still only records its offset (no `sync` for a lone zone), and gain and chmap are still
-recorded and not applied. `src/tests/replay.py` replays capture3's requests and audio
+still only records its offset (no `sync` for a lone zone), and gain is still recorded
+and not applied. A channel mask other than -1 is expanded to full frames with silence in
+the absent channels (section 14.7). `src/tests/replay.py` replays capture3's requests and audio
 against the null output, checks the replies and the clock against it, and checks the
 output dump bit for bit (16 → S32_LE) at the frame the start time names.
+
+### 14.7 CHMAP: channels present, and the silence lead-in
+
+**Semantics [verified].** `RAAT__stream_write_metadata_chmap`
+(`native/libraatmanager.c`, around line 24500) treats `chmap` as a bitmask of the
+channels present in the payload, bit *c* for channel *c*:
+
+- `-1`: every channel is present; the payload is full frames (the normal case).
+- otherwise each of the `nsamples` frames carries only the channels whose bit is set,
+  packed in channel order. The stream gets `nsamples` full frames, prefilled with
+  silence (0 for PCM), with the present channels copied in.
+- The Lua binding only rejects data *longer* than `nsamples` full frames. Data shorter
+  than the mask needs is an error in this repo's endpoint.
+
+So `chmap 0` with an empty payload means "`nsamples` frames of silence".
+
+**Seen on the wire (native1).** On a same-format track change, with no new `setup`,
+the Core opened the new stream's audio connection with `STREAMID`, `STREAMSAMPLE 0`,
+`CHMAP 0`, `DATA nsamples=15000 nbytes=0`, then `CHMAP -1` and the usual 15000-frame
+chunks. That is 15000 frames (340 ms at 44.1 kHz) of silence at stream samples
+0-14999, and the audio from sample 15000 on. Why the Core inserts it (a lead-in for the
+new track, perhaps to cover the restart) is not known, nor when it does: capture3's
+same-format next-track stream had no lead-in.
+
+The first version of this repo's endpoint rejected that empty `DATA`. The script error
+tore the session down, and the Core lost the zone. `stream_write` now expands masks as
+above, and `src/tests/test_stream.c` plus the native1 replay in `src/tests/replay.py`
+cover it. The replay checks 15000 silent frames at the stream's start frame, then the
+captured payload bit for bit.

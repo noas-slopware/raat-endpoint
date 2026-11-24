@@ -107,8 +107,8 @@ static void ring_zero(stream_t *s, int64_t sample, int64_t n)
 		memset(s->data, 0, (size_t)((n - first) * s->bpf));
 }
 
-int stream_write(stream_t *s, int64_t sample, double gain, double peak, const uint8_t *data,
-		 size_t len, int64_t n, int32_t chmap, bool has_chmap, const char **err)
+static int write_frames(stream_t *s, int64_t sample, double gain, double peak, const uint8_t *data,
+			size_t len, int64_t n, int32_t chmap, bool has_chmap, const char **err)
 {
 	if (n < 0 || sample < 0) {
 		*err = "invalid sample or nsamples";
@@ -129,8 +129,7 @@ int stream_write(stream_t *s, int64_t sample, double gain, double peak, const ui
 	 * 0.0). gain/peak are kept as metadata and never applied: bit-perfect. */
 	s->gain = gain;
 	s->peak = peak;
-	/* The Core sent CHMAP -1 (stereo, default order) once per connection
-	 * (capture3). The map is recorded, not applied; frames go out in wire order. */
+	/* the map as sent; stream_write() has already expanded the frames */
 	if (has_chmap)
 		s->chmap = chmap;
 	if (s->empty) {
@@ -236,4 +235,46 @@ void stream_read(stream_t *s, uint8_t *dst, int64_t n)
 	pthread_mutex_unlock(&s->mu);
 	if (got < n)
 		LOGT("[stream] short by %lld samples, padded with silence", (long long)(n - got));
+}
+
+/*
+ * CHMAP is a bitmask of the channels present in the payload: -1 means all of
+ * them (full frames, the normal case). Otherwise every frame holds only the
+ * channels whose bit is set, packed in channel order, and the others are
+ * silence. The Core uses chmap 0 with an empty payload to insert nsamples
+ * frames of silence (seen at the start of a stream that follows another one
+ * of the same format). Same as RoonBridge: expand to full frames, PCM silence
+ * is 0.
+ */
+int stream_write(stream_t *s, int64_t sample, double gain, double peak, const uint8_t *data,
+		 size_t len, int64_t n, int32_t chmap, bool has_chmap, const char **err)
+{
+	if (!has_chmap || chmap == -1)
+		return write_frames(s, sample, gain, peak, data, len, n, chmap, has_chmap, err);
+	if (n < 0 || n > s->capacity) {
+		*err = "invalid nsamples";
+		return -1;
+	}
+	int bps = s->bpf / s->channels, present = 0;
+	for (int c = 0; c < s->channels; c++)
+		present += (chmap >> c) & 1;
+	if ((uint64_t)n * (uint64_t)present * (uint64_t)bps > len) {
+		*err = "data is shorter than the channel map needs";
+		return -1;
+	}
+	uint8_t *full = calloc((size_t)n ? (size_t)n : 1, (size_t)s->bpf);
+	if (!full) {
+		*err = "out of memory";
+		return -1;
+	}
+	const uint8_t *in = data;
+	for (int64_t f = 0; f < n; f++)
+		for (int c = 0; c < s->channels; c++)
+			if ((chmap >> c) & 1) {
+				memcpy(full + f * s->bpf + c * bps, in, (size_t)bps);
+				in += bps;
+			}
+	int r = write_frames(s, sample, gain, peak, full, (size_t)n * (size_t)s->bpf, n, chmap, true, err);
+	free(full);
+	return r;
 }

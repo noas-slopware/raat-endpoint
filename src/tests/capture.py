@@ -14,8 +14,12 @@ def packets(path):
     off = 24
     while off + 16 <= len(d):
         sec, usec, incl, _ = struct.unpack('<IIII', d[off:off + 16])
-        yield sec + usec / 1e6, d[off + 16:off + 16 + incl]
+        if off + 16 + incl > len(d):
+            break  # truncated last record
+        pkt = d[off + 16:off + 16 + incl]
         off += 16 + incl
+        if len(pkt) >= 34:
+            yield sec + usec / 1e6, pkt
 
 
 class Stream:

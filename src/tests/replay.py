@@ -17,7 +17,10 @@ usage: replay.py [--qemu qemu-arm] <raat-endpoint binary>
    clock must behave as captured, and the null output's dump must hold the
    sent PCM bit for bit (widened to S32_LE as on the R26) at the frame the
    start time names.
-4. Synthetic checks from the spec and the scripts' logic (not from a capture):
+4. Same-format track change from native1 (a capture against this endpoint;
+   only its Core->endpoint audio bytes are used): the CHMAP 0 silence lead-in
+   must come out as 15000 silent frames, then the payload bit for bit.
+5. Synthetic checks from the spec and the scripts' logic (not from a capture):
    setup/stream/audio/clock/start/stop/end_stream/teardown on the null output,
    sync against a fake master clock, disable/cancel, SOOD on unicast loopback,
    and an API audit of every native name the scripts reference.
@@ -35,6 +38,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -51,6 +55,7 @@ CAP1 = os.path.join(CAPDIR, 'capture', 'raat.pcap')
 CAP2 = os.path.join(CAPDIR, 'capture2', 'raat.pcap')
 CAP3 = os.path.join(CAPDIR, 'capture3', 'raat.pcap')
 CAP3_HW = os.path.join(CAPDIR, 'capture3', 'hw_params.txt')
+NATIVE1 = os.path.join(CAPDIR, 'native1', 'raat.pcap')
 
 LL_REQUEST, LL_RESPONSE, LL_KEEPALIVE, LL_BEGIN_KA = 0x80000001, 0x80000002, 0x80000003, 0x80000004
 SERVICE_ID = 'd7634b85-8190-470f-aa51-6cb5538dc1b9'
@@ -164,9 +169,22 @@ class LL:
     def __init__(self, port):
         self.s = socket.create_connection(('127.0.0.1', port), timeout=5)
         self.buf = b''
+        self.lock = threading.Lock()
+        self.closed = threading.Event()
+        # Ping every 2 s like the Core, so the endpoint's keepalive timeout
+        # (10 s after LL_BEGIN_KEEPALIVE) never fires during long phases.
+        threading.Thread(target=self._pinger, daemon=True).start()
+
+    def _pinger(self):
+        while not self.closed.wait(2.0):
+            try:
+                self.send_raw(LL_KEEPALIVE, b'')
+            except OSError:
+                return
 
     def send_raw(self, typ, body):
-        self.s.sendall(struct.pack('>II', 8 + len(body), typ) + body)
+        with self.lock:
+            self.s.sendall(struct.pack('>II', 8 + len(body), typ) + body)
 
     def request(self, rid, obj):
         self.send_raw(LL_REQUEST, struct.pack('>I', rid) + json.dumps(obj).encode())
@@ -197,6 +215,7 @@ class LL:
             self.buf += d
 
     def close(self):
+        self.closed.set()
         self.s.close()
 
 
@@ -416,6 +435,10 @@ def run(proc, mport, sport, mgr_in, exp_mgr, dev_in, exp_dev, exp_info, scripts,
         replay3(dc, sink)
     else:
         print(f'== playback replay skipped: {CAP3} not found')
+    if os.path.exists(NATIVE1):
+        native1_replay(dc, sink)
+    else:
+        print(f'== same-format track change skipped: {NATIVE1} not found')
     synthetic(dc, mc, exp_info)
     sood_test(sport, mport)
     api_audit(binary, qemu, scripts)
@@ -675,6 +698,113 @@ def replay3(dc, sink):
             want = round((q2[2] - q1[2]) * rate_hz / 1e9)
             check(abs((q2[1] - q1[1]) - want) <= 1,
                   f'start rid {r2}: frame offset from rid {r1} matches the time difference ({q2[1] - q1[1]} vs {want})')
+
+
+def native1_replay(dc, sink):
+    """Same-format track change from native1: the Core starts the second
+    stream with CHMAP 0 + DATA(15000 frames, 0 bytes), i.e. 15000 frames of
+    silence, then CHMAP -1 and full frames. That stream tore our session down
+    before stream_write learnt channel masks."""
+    print('== same-format track change (native1: CHMAP 0 silence lead-in)')
+    st = capture.tcp_streams(NATIVE1)
+    audio = sorted((s for s in st.values() if s.data[:1] == b'\x02'), key=lambda s: s.t0)
+    cmds = [capture.audio_commands(s) for s in audio]
+    bi = next((i for i, c in enumerate(cmds) if any(x[1] == 1 and x[2][0] not in (-1,) for x in c)), None)
+    if not bi:
+        check(False, 'native1: a stream with a CHMAP other than -1')
+        return
+    a_cmds, b_cmds = cmds[bi - 1], cmds[bi]
+    sid_a, sid_b = a_cmds[0][2][0], b_cmds[0][2][0]
+    head = [(x[1], x[2]) for x in b_cmds[:5]]
+    check(head[:5] == [(2, (sid_b,)), (3, (0,)), (1, (0,)), (0, (15000, 0)), (1, (-1,))],
+          'native1: stream opens STREAMID, STREAMSAMPLE 0, CHMAP 0, DATA 15000/0, CHMAP -1', repr(head))
+    # format of stream A: the setup before the stream request carrying sid_a
+    fmt = None
+    for s in st.values():
+        frames, _ = capture.ll_frames(s)
+        for o, t, b in frames:
+            if t == 1:
+                j = json.loads(b[4:])
+                if j.get('request') == 'setup':
+                    last_fmt = j['format']
+                elif j.get('request') == 'stream' and j.get('stream_id') == sid_a:
+                    fmt = last_fmt
+    if not fmt or fmt['bits_per_sample'] != 16:
+        check(False, 'native1: 16-bit setup found for the stream before', repr(fmt))
+        return
+    rate = fmt['sample_rate']
+    # The capture ends inside the second DATA; zero-pad it to its declared size
+    # and compare only the bytes that were captured.
+    last = b_cmds[-1]
+    captured_b = last[3]
+    if last[1] == 0 and len(last[3]) < last[2][1]:
+        b_cmds = b_cmds[:-1] + [(last[0], 0, last[2], last[3] + bytes(last[2][1] - len(last[3])))]
+
+    before = set(os.listdir(sink))
+    sess_req(dc, 300, {'request': 'setup', 'format': fmt})
+    f1, f2 = read_sess(dc), read_sess(dc)
+    if not (isinstance(f2, tuple) and f2[2].get('status') == 'Success'):
+        check(False, 'native1: setup', repr((f1, f2)))
+        return
+    clk = Clock(f2[2]['clock_port'])
+    aport = f2[2]['audio_port_tcp']
+    times = {}
+    socks = []
+    for rid, sid, c, nchunks in ((301, sid_a, a_cmds, 8), (303, sid_b, b_cmds, None)):
+        sess_req(dc, rid, {'request': 'stream', 'stream_id': sid, 'first_seq': -1, 'nak_port': -1,
+                           'buffer_size': 10, 'ready_threshold': 0.2})
+        until_rid(dc, rid)  # Buffering
+        sk = socket.create_connection(('127.0.0.1', aport), timeout=5)
+        socks.append(sk)
+        if nchunks:
+            keep, n = [], 0
+            for x in c:
+                n += x[1] == 0
+                if n <= nchunks:
+                    keep.append(x)
+            c = keep
+        sk.sendall(capture.audio_serialize(c))
+        if nchunks:
+            until_rid(dc, rid)  # Ready
+        else:
+            time.sleep(0.1)  # 30000 frames: below the Ready threshold; start from BUFFERING
+        d = clk.burst()
+        sess_req(dc, rid + 1, {'request': 'start', 'min_offset': d[2] + 20000000, 'stream_sample': 0})
+        r = until_rid(dc, rid + 1)
+        times[sid] = r[-1][2].get('time') if isinstance(r[-1], tuple) else None
+        time.sleep(0.9)
+        sess_req(dc, rid + 2, {'request': 'end_stream'})
+        r = until_rid(dc, rid + 2)
+        check(r[-1] and r[-1][2].get('status') == 'Success' and not any(x == 'EOF' for x in r),
+              f'native1: stream {sid} survives to end_stream', repr(r[-3:]))
+    sess_req(dc, 310, {'request': 'teardown'})
+    until_rid(dc, 300)
+    for sk in socks:
+        sk.close()
+    new = sorted(set(os.listdir(sink)) - before, key=lambda n: int(re.sub(r'\D', '', n)))
+    data = open(os.path.join(sink, new[-1]), 'rb').read() if new else b''
+    bpf = 8  # S32_LE stereo, as the fixture's container
+
+    def locate(pcm):
+        e = widen16(pcm)
+        nz = next(i for i in range(0, len(e), bpf) if e[i:i + bpf] != bytes(bpf))
+        p = data.find(e[nz:nz + 8192])
+        while p >= 0 and p % bpf:
+            p = data.find(e[nz:nz + 8192], p + 1)
+        return (p - nz) // bpf if p >= 0 else None, e
+
+    pa, _ = locate(b''.join(x[3] for x in a_cmds if x[1] == 0))
+    pb_data, eb = locate(captured_b)
+    if pa is None or pb_data is None or None in times.values():
+        check(False, 'native1: both streams found in the output dump', repr((pa, pb_data, times)))
+        return
+    pb = pa + round((times[sid_b] - times[sid_a]) * rate / 1e9)
+    check(abs(pb_data - (pb + 15000)) <= 1, f'native1: payload starts 15000 frames after the stream start '
+          f'(frame {pb_data} vs {pb} + 15000)')
+    check(not any(data[pb * bpf:pb_data * bpf]), 'native1: those 15000 frames are silence')
+    n = len(captured_b) // 4
+    check(data[pb_data * bpf:(pb_data + n) * bpf] == eb[:n * bpf],
+          f'native1: then all {n} captured frames bit-exact (16-bit widened to S32_LE)')
 
 
 def synthetic(dc, mc, exp_info):
