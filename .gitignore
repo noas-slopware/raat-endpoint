@@ -1,6 +1,8 @@
 *.pcap
 capture*/
 decoded/
-src/
+# the endpoint lives in src/; only its build output is ignored
+src/build/
+__pycache__/
 native/
 r26cap
