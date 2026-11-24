@@ -22,6 +22,8 @@
 
 static struct {
 	io_watch_t w, nlw;
+	ltimer_t burst;
+	int burst_left;
 	int port;
 	bool multicast;
 	char *keys[MAX_KV], *vals[MAX_KV];
@@ -184,14 +186,58 @@ static void announce(void)
 		    !(i->ifa_flags & IFF_MULTICAST) || (i->ifa_flags & IFF_LOOPBACK))
 			continue;
 		struct in_addr ifaddr = ((struct sockaddr_in *)i->ifa_addr)->sin_addr;
-		if (setsockopt(S.w.fd, IPPROTO_IP, IP_MULTICAST_IF, &ifaddr, sizeof ifaddr) < 0)
-			continue;
-		if (sendto(S.w.fd, out, o, 0, (struct sockaddr *)&to, sizeof to) < 0)
-			LOGW("[sood] announce on %s: %s", i->ifa_name, strerror(errno));
-		else
+		bool sent = false;
+		if (setsockopt(S.w.fd, IPPROTO_IP, IP_MULTICAST_IF, &ifaddr, sizeof ifaddr) == 0 &&
+		    sendto(S.w.fd, out, o, 0, (struct sockaddr *)&to, sizeof to) >= 0)
+			sent = true;
+		/* RoonBridge also sends it to every interface's subnet broadcast */
+		if ((i->ifa_flags & IFF_BROADCAST) && i->ifa_broadaddr) {
+			struct sockaddr_in bc = { .sin_family = AF_INET, .sin_port = htons(SOOD_DEFAULT_PORT),
+						  .sin_addr = ((struct sockaddr_in *)i->ifa_broadaddr)->sin_addr };
+			if (sendto(S.w.fd, out, o, 0, (struct sockaddr *)&bc, sizeof bc) >= 0)
+				sent = true;
+		}
+		if (sent)
 			LOGI("[sood] announced on %s", i->ifa_name);
+		else
+			LOGW("[sood] announce on %s: %s", i->ifa_name, strerror(errno));
 	}
 	freeifaddrs(ifa);
+}
+
+/*
+ * Announce whenever an address appears (start, link up, DHCP), then again
+ * with backoff (1, 3, 7, 15, 31, 63 s after) until a Core connects. One
+ * packet is not enough: after a reboot with a new (random) MAC, a Core that
+ * still holds the old one in its neighbour cache spends several seconds
+ * probing it before it re-resolves, and every announce in that window is
+ * answered into the void; the Core then waits for the next one. One-shot
+ * timers only, and none once a Core is connected or the schedule ends.
+ */
+static const int burst_gap_ms[] = { 1000, 2000, 4000, 8000, 16000, 32000 };
+#define BURST_N ((int)(sizeof burst_gap_ms / sizeof burst_gap_ms[0]))
+
+static void burst_cb(ltimer_t *t)
+{
+	(void)t;
+	announce();
+	if (--S.burst_left > 0)
+		loop_timer_start(&S.burst, burst_gap_ms[BURST_N - S.burst_left], 0);
+}
+
+static void announce_burst(void)
+{
+	announce();
+	S.burst_left = BURST_N;
+	loop_timer_start(&S.burst, burst_gap_ms[0], 0);
+}
+
+void sood_core_connected(void)
+{
+	if (S.multicast && loop_timer_active(&S.burst)) {
+		loop_timer_stop(&S.burst);
+		LOGD("[sood] a Core is connected, announcing stopped");
+	}
 }
 
 static void sood_io(io_watch_t *w, uint32_t ev)
@@ -217,7 +263,7 @@ static void netlink_io(io_watch_t *w, uint32_t ev)
 		changed = true;
 	if (changed) {
 		join_all();
-		announce();
+		announce_burst();
 	}
 }
 
@@ -256,7 +302,9 @@ int sood_start(const char *bind_addr, int port, bool join_multicast, const struc
 	if (join_multicast) {
 		unsigned char off = 0;
 		setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &off, sizeof off);
-		announce();
+		setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof one);
+		loop_timer_init(&S.burst, burst_cb, NULL);
+		announce_burst();
 	}
 	return 0;
 }
@@ -264,6 +312,8 @@ int sood_start(const char *bind_addr, int port, bool join_multicast, const struc
 void sood_stop(void)
 {
 	int fd = S.w.fd, nl = S.nlw.fd;
+	if (S.multicast)
+		loop_timer_stop(&S.burst);
 	loop_io_del(&S.w);
 	loop_io_del(&S.nlw);
 	if (fd >= 0)

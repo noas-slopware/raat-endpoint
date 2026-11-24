@@ -1,4 +1,5 @@
 #include "manager.h"
+#include "sood.h"
 #include "device.h"
 #include "devserver.h"
 #include "ll.h"
@@ -554,7 +555,8 @@ static void mgr_accept(io_watch_t *w, uint32_t ev)
 				LOGW("[manager] accept: %s", strerror(errno));
 			return;
 		}
-		ll_new(fd, &mgr_ops, NULL, "manager");
+		if (ll_new(fd, &mgr_ops, NULL, "manager"))
+			sood_core_connected(); /* found: no more announcing needed */
 	}
 }
 

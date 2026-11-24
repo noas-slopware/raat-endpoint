@@ -15,6 +15,8 @@ struct sood_kv {
 /* kv: reply keys (service_id included), NULL-terminated, copied. */
 int sood_start(const char *bind_addr, int port, bool join_multicast, const struct sood_kv *kv);
 int sood_port(void);
+/* a Core connected to the manager: stop the announce backoff */
+void sood_core_connected(void);
 void sood_stop(void);
 
 #endif

@@ -1,0 +1,17 @@
+[Unit]
+Description=Native RAAT (Roon Ready) audio endpoint
+Documentation=https://github.com/noas-slopware/raat-endpoint
+# The DAC may enumerate later (it is watched through /dev/snd), and the SOOD
+# socket re-joins the group and re-announces when an address appears.
+After=network.target sound.target
+
+[Service]
+ExecStart=/usr/local/bin/raat-endpoint -d /var/lib/raat-endpoint
+Restart=on-failure
+RestartSec=2
+# the ALSA thread runs SCHED_RR 95, as RoonBridge's does
+LimitRTPRIO=95
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target
