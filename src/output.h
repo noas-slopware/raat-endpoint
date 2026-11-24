@@ -12,11 +12,14 @@ typedef struct output output_t;
 
 extern int g_alsa_buffer_ms;
 extern int64_t g_extra_delay_ns;
+extern char *g_null_sink_dir; /* tests: null backend writes sink-<n>.raw here */
 
 /* Opens the device at exactly this format and starts the thread (silence).
  * On failure returns NULL and sets *status to a RAAT__OUTPUT_PLUGIN_STATUS_* name. */
-output_t *output_open(const pdev_t *pd, int rate, int bits, int channels, const char **status);
-void output_close(output_t *o);
+output_t *output_open(const pdev_t *pd, int rate, int bits, int channels, int64_t clock_base,
+		      const char **status);
+/* Returns the local time at close, the base for the device's next setup. */
+int64_t output_close(output_t *o);
 
 int output_start(output_t *o, int64_t time_ns, int64_t stream_sample, stream_t *st, const char **err);
 int output_stop(output_t *o, const char **err);

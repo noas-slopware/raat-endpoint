@@ -3,11 +3,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* TODO(playback capture: `stream` request `buffer_size`): the script asks for
- * 2 * buffer_size * sample_rate frames (spec 11.5). The real buffer_size is not
- * in any capture yet. Until it is known, cap the ring so one stream cannot eat
- * the 128 MiB box; the cap never goes below half the request (= buffer_size,
- * the amount the Core keeps in flight). Tune once a capture shows the value. */
+/* The script asks for 2 * buffer_size * sample_rate frames (spec 11.5). The
+ * Core sent buffer_size 10 (seconds) and kept about 5.4 s of audio in flight
+ * ahead of the play position: a 5 s burst, then real-time pacing in
+ * 15000-frame chunks (capture3, 44.1 kHz). At 768 kHz/32-bit/2 ch the full
+ * request would be 123 MB, so the ring is capped by a byte budget but never
+ * below 0.3 * the request (6 s at buffer_size 10), which covers the observed
+ * lead. Whether the lead scales with rate is not known (only 44.1 kHz seen). */
 size_t g_stream_max_bytes = 32u << 20;
 
 stream_t *stream_new(const char *sample_type, int rate, int bits, int channels, int64_t capacity,
@@ -36,8 +38,8 @@ stream_t *stream_new(const char *sample_type, int rate, int bits, int channels, 
 	int64_t want = capacity;
 	if ((uint64_t)capacity * (uint64_t)bpf > g_stream_max_bytes) {
 		int64_t capped = (int64_t)(g_stream_max_bytes / (size_t)bpf);
-		if (capped < capacity / 2)
-			capped = capacity / 2;
+		if (capped < capacity * 3 / 10)
+			capped = capacity * 3 / 10;
 		capacity = capped;
 		LOGW("[stream] capacity %lld frames (%lld bytes) above budget; using %lld frames",
 		     (long long)want, (long long)want * bpf, (long long)capacity);
@@ -123,12 +125,12 @@ int stream_write(stream_t *s, int64_t sample, double gain, double peak, const ui
 	pthread_mutex_lock(&s->mu);
 	s->write_count++;
 	s->samples_in += n;
-	/* TODO(playback capture: COMMAND_NORMALIZATION values): gain/peak are kept
-	 * as metadata only and never applied, so output stays bit-perfect. */
+	/* The Core sent no COMMAND_NORMALIZATION at all in capture3 (gain stays
+	 * 0.0). gain/peak are kept as metadata and never applied: bit-perfect. */
 	s->gain = gain;
 	s->peak = peak;
-	/* TODO(playback capture: COMMAND_CHMAP values): the map is recorded, not
-	 * applied; frames go out in wire order. */
+	/* The Core sent CHMAP -1 (stereo, default order) once per connection
+	 * (capture3). The map is recorded, not applied; frames go out in wire order. */
 	if (has_chmap)
 		s->chmap = chmap;
 	if (s->empty) {

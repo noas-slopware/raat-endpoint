@@ -16,7 +16,8 @@ scripts are in this repository; `RAAT-PROTOCOL.md` describes behaviour and cites
 | `tools/ll_decode.py` | reassembles the TCP streams of a capture and decodes the RAAT frames to JSON lines |
 | `src/` | the endpoint in C: SOOD responder, manager JSON-RPC, per-device LL server, Lua 5.3 host for the Core's scripts with the `raat`/`buffer`/`stream`/`uv` surface, ALSA output thread. `make`, `make armhf`, `make test` |
 
-Status: the offline parts of the endpoint are written and pass a replay of the captured handshake
-(`src/tests/replay.py`, reads the captures from outside the repo). Not run against a Core or a DAC
-yet. A capture during playback is still needed for the stream buffer size, start time, clock sync
-and output delay details; the code marks each spot with `TODO(playback capture: ...)`.
+Status: the endpoint is written and passes a replay of the captured handshake and of a playback
+capture (play, seek, pause, resume, next track at 44.1 kHz), including a bit-for-bit check of what
+the output plays (`src/tests/replay.py`, reads the captures from outside the repo). Not run against
+a Core or a DAC yet. Still unseen: format changes, high rates, grouped zones (`sync`), gapless
+track ends.

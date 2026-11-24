@@ -36,7 +36,8 @@ static void usage(void)
 		"  -n, --name NAME         machine_name (default: host name)\n"
 		"      --vendor V, --model M  identity reported in discovery (default: null)\n"
 		"      --raat-version V    raat_version to advertise (default 1.1.38)\n"
-		"      --alsa-buffer-ms N  device buffer (default 100)\n"
+		"      --alsa-buffer-ms N  device buffer, two periods (default 40)\n"
+		"      --null-sink DIR     with --fixture: dump what the null output plays\n"
 		"      --stream-max-mb N   cap for one stream ring buffer (default 32)\n"
 		"      --lua-mem-mb N      Lua heap limit per session (default 24)\n"
 		"      --dump-lua-api      print the Lua API surface and exit\n"
@@ -117,7 +118,7 @@ int main(int argc, char **argv)
 	int mport = -1, sport = 9003;
 	bool no_sood = false, no_mcast = false, dump = false;
 	enum { O_SOOD_PORT = 256, O_NO_SOOD, O_NO_MCAST, O_FIXTURE, O_VENDOR, O_MODEL, O_RAATV,
-	       O_ABUF, O_SMAX, O_LMEM, O_DUMP };
+	       O_ABUF, O_SMAX, O_LMEM, O_DUMP, O_SINK };
 	static const struct option lo[] = {
 		{ "data-dir", required_argument, 0, 'd' },
 		{ "bind", required_argument, 0, 'b' },
@@ -134,6 +135,7 @@ int main(int argc, char **argv)
 		{ "stream-max-mb", required_argument, 0, O_SMAX },
 		{ "lua-mem-mb", required_argument, 0, O_LMEM },
 		{ "dump-lua-api", no_argument, 0, O_DUMP },
+		{ "null-sink", required_argument, 0, O_SINK },
 		{ "help", no_argument, 0, 'h' },
 		{ 0, 0, 0, 0 }
 	};
@@ -155,6 +157,7 @@ int main(int argc, char **argv)
 		case O_SMAX: g_stream_max_bytes = (size_t)atoi(optarg) << 20; break;
 		case O_LMEM: g_lua_mem_limit = (size_t)atoi(optarg) << 20; break;
 		case O_DUMP: dump = true; break;
+		case O_SINK: g_null_sink_dir = optarg; break;
 		case 'v': verbose++; break;
 		case 'q': g_log_level = LOG_WARN; break;
 		default: usage(); return c == 'h' ? 0 : 2;

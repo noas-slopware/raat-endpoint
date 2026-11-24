@@ -208,6 +208,7 @@ static int scan_fixture(pdev_t **out, int *n)
 		copy_json_str(d->components, sizeof d->components, dj, "components");
 		copy_json_str(d->driver, sizeof d->driver, dj, "driver");
 		copy_json_str(d->mixername, sizeof d->mixername, dj, "mixername");
+		copy_json_str(d->container, sizeof d->container, dj, "container");
 		d->card = k - 1;
 		d->backend = BACKEND_NULL;
 		fixture_formats(d, cJSON_GetObjectItemCaseSensitive(dj, "supported_formats"));
@@ -225,12 +226,15 @@ static const unsigned std_rates[] = { 44100, 48000, 88200, 96000, 176400, 192000
 				      352800, 384000, 705600, 768000 };
 
 /* Container formats per wire bit depth. Wire PCM is packed little-endian
- * (spec 13.6); 24-bit may also go into a 32-bit container, which is lossless. */
+ * (spec 13.6); 16- and 24-bit may also go into a 32-bit container, which is
+ * lossless. The R26 offered 16/24/32 bits on the G20, whose only container is
+ * S32_LE, and played 16-bit tracks as S32_LE (capture3). */
 static const struct {
 	snd_pcm_format_t f;
 	int bits;
 } containers[] = {
 	{ SND_PCM_FORMAT_S16_LE, 16 },
+	{ SND_PCM_FORMAT_S32_LE, 16 },
 	{ SND_PCM_FORMAT_S24_3LE, 24 },
 	{ SND_PCM_FORMAT_S24_LE, 24 },
 	{ SND_PCM_FORMAT_S32_LE, 24 },

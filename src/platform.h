@@ -24,6 +24,7 @@ typedef struct pdev {
 	char components[128];
 	char driver[64];
 	char mixername[128];
+	char container[16];   /* fixture only: ALSA container the null backend mimics */
 	int card, dev;
 	int backend;
 	pcm_fmt_t *fmts;

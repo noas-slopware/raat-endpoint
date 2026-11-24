@@ -27,6 +27,7 @@ typedef struct mdev {
 	struct session *owner;
 	int owner_cb_ref; /* {on_setup, on_output_lost} in the owner's registry */
 	io_watch_t out_w;
+	int64_t clock_carry; /* local time where the last setup stopped */
 
 	struct mdev *next;
 } mdev_t;

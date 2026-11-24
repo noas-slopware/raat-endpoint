@@ -46,7 +46,7 @@ void dev_output_release(mdev_t *d, bool notify, const char *reason_json)
 	if (!d->out)
 		return;
 	loop_io_del(&d->out_w);
-	output_close(d->out);
+	d->clock_carry = output_close(d->out);
 	d->out = NULL;
 	session_t *owner = d->owner;
 	int ref = d->owner_cb_ref;
@@ -83,6 +83,10 @@ static int o_setup(lua_State *L)
 	char type[16];
 	strlcpy0(type, lua_isstring(L, -1) ? lua_tostring(L, -1) : "", sizeof type);
 	lua_pop(L, 1);
+	/* The Core sends sample_subtype "none" (capture3); MQA is not offered. */
+	lua_getfield(L, 1, "sample_subtype");
+	bool plain = lua_isnil(L, -1) || (lua_isstring(L, -1) && !strcmp(lua_tostring(L, -1), "none"));
+	lua_pop(L, 1);
 	bool ok = true;
 	int rate = field_num(L, 1, "sample_rate", &ok);
 	int bits = field_num(L, 1, "bits_per_sample", &ok);
@@ -96,10 +100,10 @@ static int o_setup(lua_State *L)
 
 	const char *status = NULL;
 	output_t *o = NULL;
-	if (!ok || strcmp(type, "pcm"))
+	if (!ok || !plain || strcmp(type, "pcm"))
 		status = "RAAT__OUTPUT_PLUGIN_STATUS_FORMAT_NOT_SUPPORTED"; /* PCM only, no DSD */
 	else
-		o = output_open(&d->pd, rate, bits, ch, &status);
+		o = output_open(&d->pd, rate, bits, ch, d->clock_carry, &status);
 	if (!o) {
 		LOGW("[output] setup %s %d/%d/%d failed: %s", type, rate, bits, ch, status);
 		session_defer_setup_cb(s, cb_ref, false, 0, status);
@@ -111,10 +115,11 @@ static int o_setup(lua_State *L)
 	d->owner_cb_ref = cb_ref;
 	loop_io_add(&d->out_w, output_event_fd(o), EPOLLIN, on_out_event, d);
 	LOGI("[output] setup %s %d/%d/%d token=%d", type, rate, bits, ch, d->token);
-	session_defer_setup_cb(s, cb_ref, true, d->token, NULL);
+	/* The signal path reaches the Core before the setup Success (capture3). */
 	char *sp = output_signal_path_json(o);
 	session_defer_output_message(s, sp);
 	cJSON_free(sp);
+	session_defer_setup_cb(s, cb_ref, true, d->token, NULL);
 	return 0;
 }
 

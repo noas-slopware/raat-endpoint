@@ -3,7 +3,8 @@
 
 usage: ll_decode.py <in.pcap> <outdir>
 
-Writes <outdir>/frames.jsonl (one decoded frame per line) and, for every
+Writes <outdir>/frames.jsonl (one decoded frame per line), <outdir>/udp.jsonl
+(UDP, e.g. the clock exchange) and, for every
 load_script request, <outdir>/script-<n>.lua with the script text.
 Handles in-order data only (enough for a LAN capture); retransmits are dropped.
 """
@@ -26,6 +27,8 @@ def tcp_streams(path):
     streams = {}
     for ts, pkt in packets(path):
         ip = pkt[14:]
+        if ip[9] != 6:  # TCP only here; UDP (clock sync) is listed by udp_packets()
+            continue
         ihl = (ip[0] & 0xf) * 4
         tot = struct.unpack('>H', ip[2:4])[0]
         src, dst = ip[12:16], ip[16:20]
@@ -47,6 +50,16 @@ def tcp_streams(path):
             st['data'] += payload
             st['next'] = (seq + len(payload)) & 0xffffffff
     return streams
+
+
+def udp_packets(path):
+    for ts, pkt in packets(path):
+        ip = pkt[14:]
+        if ip[9] != 17:
+            continue
+        ihl = (ip[0] & 0xf) * 4
+        sp, dp, ulen = struct.unpack('>HHH', ip[ihl:ihl + 6])
+        yield ts, '.'.join(map(str, ip[12:16])), sp, '.'.join(map(str, ip[16:20])), dp, bytes(ip[ihl + 8:ihl + ulen])
 
 
 def ll_frames(data):
@@ -92,7 +105,13 @@ def main():
                 except ValueError:
                     rec['raw'] = js[:200].decode(errors='replace')
             out.write(json.dumps(rec) + '\n')
-    print(f'{nscript} load_script request(s)')
+    with open(os.path.join(outdir, 'udp.jsonl'), 'w') as u:
+        nudp = 0
+        for ts, src, sp, dst, dp, body in udp_packets(pcap):
+            nudp += 1
+            u.write(json.dumps({'t': round(ts, 6), 'from': f'{src}:{sp}', 'to': f'{dst}:{dp}',
+                                'len': len(body), 'head': body[:48].hex()}) + '\n')
+    print(f'{nscript} load_script request(s), {nudp} UDP packet(s)')
 
 
 if __name__ == '__main__':

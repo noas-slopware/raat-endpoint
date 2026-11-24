@@ -730,8 +730,8 @@ Revised with the capture. Section numbers point at the details.
      `{is_supported=false}`. Then the multicast bus (section 13.9) stays off.
    - Hook or override `os.exit`. The `force_exit` request calls it (section 13.11).
    - **Memory.** The script allocates a `stream` of `2 * buffer_size * sample_rate`
-     frames (`script-4.lua:1275-1278`). `buffer_size` is a Core-chosen number of seconds
-     that is not in the capture. At 192 kHz, 2 ch and 32 bits, each second of
+     frames (`script-4.lua:1275-1278`). `buffer_size` is a Core-chosen number of seconds:
+     10 in capture3, of which at most about 5.4 s was ever in flight (section 14.3). At 192 kHz, 2 ch and 32 bits, each second of
      `buffer_size` costs 3 MB of ring buffer. Budget for it, and cap `supported_formats`
      if RAM is tight.
 6. **Output plugin** (sections 7, 8, 13.4-13.8).
@@ -756,8 +756,9 @@ Revised with the capture. Section numbers point at the details.
    - Drift correction behind `set_remote_time(token, offset_ns, reset)`. For a lone zone,
      never insert or drop samples, so the output stays bit-perfect.
    - `teardown(token)`.
-   - After setup, send `{"signal_path":[{"type":"output","method":"alsa","quality":"lossless"}]}`
-     into `raat.output.message_handlers`. It reaches the Core as `OutputMessage`.
+   - During setup, send `{"signal_path":[{"type":"output","method":"alsa","quality":"lossless","alsa_device":{...card info...}}]}`
+     into `raat.output.message_handlers`, before `on_setup` fires. It reaches the Core
+     as `OutputMessage`, ahead of the setup `Success` (section 14.2).
 7. **Audio TCP listener and clock UDP socket.** The script opens both itself through luv.
    The endpoint only needs working luv TCP and UDP, plus a way to pass the payload into
    `stream:write`, ideally without copying.
@@ -774,6 +775,16 @@ Revised with the capture. Section numbers point at the details.
 
 ## 12. Open questions
 
+A two-way playback capture now exists (capture3, section 14). It settles, for one
+44.1 kHz/16-bit zone on its own: the `setup` format (no `wire_codec`), `stream`
+`buffer_size`/`ready_threshold`, `start` (`min_offset` only, no `time`), that a lone
+zone gets no `sync`, the audio command order and chunk size, that no
+`COMMAND_NORMALIZATION` is sent, `CHMAP` -1, how seek, pause and track change map onto
+the primitives, the clock query rate and the reported delay. The list below is kept
+as it was, with what capture3 answered marked **[c3]**; what is not marked is still
+open. Still unseen: format changes, high rates, DSD, grouped zones, a resume within the
+Core's 5 s pause window, and natural (gapless) track ends.
+
 These still need a **playback capture**, in both directions (Core to endpoint *and*
 endpoint to Core), taken while a track plays, seeks, pauses and changes format:
 
@@ -785,16 +796,22 @@ endpoint to Core), taken while a track plays, seeks, pauses and changes format:
   version. The four scripts are identical in both captures, both against 1.1.38.
 - **The values the Core sends:**
   - in `setup`: the format, and whether `wire_codec` is set when `codecs` is non-empty;
+    **[c3: plain PCM format plus `sample_subtype:"none"`, no `wire_codec` with `codecs`
+    nil; the non-empty case is still open]**
   - in `stream`: `buffer_size`, `ready_threshold`, `first_seq`, `stream_id`;
-  - in `start`: `time` versus `min_offset`;
+    **[c3: 10, 0.2, -1, a large counter; also `nak_port:-1`]**
+  - in `start`: `time` versus `min_offset`; **[c3: `min_offset` only]**
   - in `sync`: `host`/`port`, which tells who is clock master for a single zone.
+    **[c3: no `sync` at all for a lone zone; grouped zones still open]**
 - **On the audio TCP stream:** the command order, the `DATA` chunk size, whether
   `COMMAND_NORMALIZATION` carries a non-zero gain for bit-perfect playback, and the
-  `CHMAP` values.
+  `CHMAP` values. **[c3: section 14.3; no NORMALIZATION was sent; whether it appears
+  with volume leveling on is open]**
 - **Seek, pause, flush and track change:** whether the Core uses
   `stop` + `start(stream_sample)`, `end_stream` + `stream`, or a new `setup` for each.
+  **[c3: section 14.4]**
 - **The clock exchange:** the rate of `RAATCLKQ` queries from the Core, and how much
-  output delay it expects.
+  output delay it expects. **[c3: section 14.5]**
 - **Whether the ALSA output applies the per-packet `gain`** from `stream:write`
   (static trace not done).
 - **Version checks.** How strictly the Core checks `vendor`, `model` and `version`
@@ -1276,3 +1293,127 @@ Here "returns" means what the script reads back.
 - **`get_local_time` and `get_output_delay` are called from the UDP clock callback**
   on every query (`:115-147`). They must be cheap and thread-safe with respect to the
   audio thread.
+
+## 14. Playback capture (capture3)
+
+**Source.** `capture3/raat.pcap`, 75 s, both directions, TCP and UDP, between the Core
+(192.0.2.19) and the R26 (192.0.2.46) running RoonBridge on the mainline kernel,
+plus `capture3/hw_params.txt`, the ALSA state during playback. Taken on 2026-11-24.
+User actions (KST): 15:20:34 zone selected, 15:20:36 play (resume of a paused queue,
+44.1 kHz track), 15:20:52 seek +30 s, 15:21:00 pause, 15:21:06 play, 15:21:14 next
+track, 15:21:26 pause. Times below are packet times, written `c3 hh:mm:ss.mmm`.
+
+The session was already set up when the capture started (no `load_script`, `info`
+or `set_client_type`), and the manager connection carried only keepalives.
+
+**Capture loss.** The capture tool dropped packets: 97 bytes of the endpoint's session
+replies and about 0.25 MB and 0.38 MB of the second and third audio connections are
+missing. `tools/ll_decode.py` stops at the first hole; the replay test
+(`src/tests/capture.py`) rebuilds streams from all segments, resyncs after holes and
+accounts for them. The two reply holes are exactly 64 bytes (`Ready` + `Playing` on
+rid 10, c3 15:20:52.62-.72) and 33 bytes (`Playing` on rid 16, c3 15:21:06.66): the
+lengths match those frames, and the script must have sent them there.
+
+### 14.1 Requests and replies
+
+| c3 | Core → endpoint | Endpoint → Core |
+|---|---|---|
+| 15:20:37.050 | `setup` rid 6, `format{sample_type:"pcm", sample_rate:44100, bits_per_sample:16, channels:2, sample_subtype:"none"}` | rid 6 non-final `OutputMessage` (.082), then rid 6 non-final `{Success, clock_port, audio_port:0, audio_port_tcp}` (.112) |
+| 15:20:37.123 | `stream` rid 7 `{stream_id, first_seq:-1, nak_port:-1, buffer_size:10, ready_threshold:0.2}` | rid 7 `Buffering` (.125), `Ready` (.173) |
+| 15:20:37.174 | `start` rid 8 `{min_offset:69115646, stream_sample:0}` | rid 7 `Playing`, rid 8 final `{Success, time:184759306}` |
+| 15:20:52.557 | `end_stream` rid 9 (seek) | rid 7 final `Ended`, rid 9 final `Success` |
+| 15:20:52.618 | `stream` rid 10 (`stream_id` + 1), then `start` rid 11 | `Buffering`, [`Ready`, `Playing` lost], rid 11 `Success` |
+| 15:21:00.527 | `stop` rid 12 (pause) | rid 10 `Stopped`, rid 12 `Success` |
+| 15:21:05.528 | `end_stream` rid 13, `teardown` rid 14 | rid 10 `Ended`, rid 13 `Success`, rid 6 final `Teardown` (.632); nothing on rid 14 |
+| 15:21:06.548 | `setup` rid 15 (same format), `stream` rid 16, `start` rid 17 | as for rid 6-8 |
+| 15:21:14.555 | `end_stream` rid 18 (next track) | rid 16 `Ended`, rid 18 `Success` |
+| 15:21:15.900 | `stream` rid 19, `start` rid 20 (16.164) | `Buffering`, `Ready`, `Playing`, `Success` |
+| 15:21:26.582 | `stop` rid 21 (pause); 15:21:31.584 `end_stream` rid 22, `teardown` rid 23 | as for rid 12-14 |
+
+- **No `sync`, no `time` in `start`.** A lone zone is paced by the endpoint's own clock
+  (section 14.5). The script computed `time = get_local_time + min_offset` and returned it.
+- **Order inside setup.** The signal-path `OutputMessage` reaches the Core *before* the
+  setup `Success`: the output plugin posts it while setting up, ahead of `on_setup`.
+  Its element is `{type:"output", method:"alsa", quality:"lossless", alsa_device:{name,
+  id, longname, components, usbid, driver, mixername}}`, the same card object as in
+  `output.info`. There is one element only.
+- `teardown` gets no reply on its own rid (section 13.11); the setup context gets
+  `Teardown` about 100 ms later.
+- The `start` `Success` came 43 ms after `Playing` (c3 15:20:37.179 vs .222). That is
+  Nagle against delayed ACK on the endpoint's socket (`TCP_NODELAY` off, section 5.1),
+  not processing time **[inferred]**.
+
+### 14.2 Output setup on the device
+
+`hw_params.txt` during playback: `S32_LE`, 2 channels, 44100 Hz, period 882 and buffer
+1764 frames (two 20 ms periods, 40 ms), `RW_INTERLEAVED`. The G20's USB interface has
+only `S32_LE` altsets (24 and 32 valid bits), so the 16-bit stream was widened into a
+32-bit container. The R26 nevertheless offered 16, 24 and 32 bits (section 13.4), so
+the endpoint, not the Core, does the widening. Widening is lossless; a bit-perfect
+endpoint may do the same.
+
+### 14.3 Audio connection
+
+- **One TCP connection per `stream`.** Each `stream` request is followed about 3 ms
+  later by a new connection to the same `audio_port_tcp` (four connections, ports
+  34008, 52384, 49990, 41906). The listener port stays the same across setups (39655),
+  as does the clock port (54541): the script's sockets live as long as the session.
+- **Command order** on every connection: `STREAMID` (= the request's `stream_id`),
+  `STREAMSAMPLE 0`, `CHMAP -1`, then `DATA` commands only. No `NORMALIZATION`
+  (`tcp_gain` stays 0.0) and no `CODEC_DATA` were sent.
+- **Chunks.** Every `DATA` is 15000 frames, 60000 bytes (16-bit stereo, 340 ms at
+  44.1 kHz), including the last one before an `end_stream`.
+- **Pacing.** An initial burst, then real-time pacing at one chunk per 340 ms. The burst
+  was 240000 frames (5.44 s) within 0.1-0.15 s for the first and the next-track stream,
+  180000 (4.08 s) after the seek and 135000 (3.06 s) after the resume; the lead over
+  real time then stayed at that level (5.4, 4.0, 3.0 and 5.3 s). So the Core keeps at
+  most about `0.54 * buffer_size` in flight here **[whether that scales with rate or
+  buffer_size is open]**. `Ready` came after the sixth chunk (90000 > 0.2 * 441000
+  frames), about 50 ms after the first byte, and the Core sent `start` within 1 ms.
+- The Core stops sending at `stop`; the rest of the buffer is dropped by `end_stream`.
+
+### 14.4 Seek, pause, resume, track change
+
+- **Seek** = `end_stream`, then `stream` with `stream_id + 1` on a new audio connection
+  from `STREAMSAMPLE 0`, then `start{stream_sample:0}`. No new `setup`.
+- **Pause** = `stop`. After 5.0 s of pause the Core sent `end_stream` and `teardown`
+  (both pauses: 15:21:00.527 → 05.528 and 15:21:26.582 → 31.584).
+- **Resume** after that = a full new `setup` (same format), `stream`, `start`. A resume
+  inside the 5 s window, which would `start` again from `STOPPED`, was not captured.
+- **Next track** (same format) = `end_stream`, then 1.35 s later `stream` and `start`.
+  No new `setup`. A natural track end (gapless) and a format change were not captured.
+- Each stream counts its samples from 0; `first_seq` is -1 throughout.
+
+### 14.5 Clock exchange
+
+- The Core queries the endpoint (`RAATCLKQ` from Core port 36916 to the clock port) in
+  **bursts of three, 5 ms apart, every 2.0 s** (22 bursts). The first burst follows the
+  setup `Success` by 1 ms, and one burst precedes every `stream` request. There are none
+  while stopped or between `end_stream` and the next `stream`. RTTs were 0.2-0.7 ms,
+  one 1.9 ms.
+- **`time`** (the endpoint's `get_local_time`) was 0.0526 s at the first query, 62 ms
+  after the `setup` request: the clock starts at 0 with the output. It runs at wall rate (14.048 s of local
+  time over 14.048 s of capture time). Across `teardown` and the next `setup` it
+  **resumed from where it had stopped**: about 0.95 s is missing from it, close to the
+  0.92 s between the `Teardown` and the next `setup` (15:21:05.632 → 06.548). So the clock counts time with an output set up, and
+  carries over between setups of the same device.
+- **`delay`** was 49092970-49206349 ns, that is 2165-2170 frames at 44.1 kHz, steady
+  from the first query after setup on. With a 1764-frame ALSA buffer that is the buffer
+  plus about 400 frames (9 ms), presumably USB in flight **[inferred]**.
+- **`min_offset` = last delay + 20 ms** exactly, in all four `start`s (69115646 =
+  49115646 + 20000000, and likewise). The `start` reply's `time` is then
+  `get_local_time + min_offset`: 184759306 for the first, so the clock read 115.6 ms at
+  that `start`.
+
+### 14.6 What the endpoint in `src/` does with this
+
+The `TODO(playback capture)` stubs are gone; each place cites this section. The ring is
+the full request when it fits a byte budget and never below `0.3 * request`
+(`0.6 * buffer_size`, which covers the 5.4 s lead). The ALSA default is a 40 ms buffer in
+two periods. 16-bit may go into `S32_LE`. `get_output_delay` is the device queue right
+after a write. The clock starts at 0 and carries across setups. The signal path is sent
+before `on_setup`, and `sample_subtype` other than `"none"` is refused. `set_remote_time`
+still only records its offset (no `sync` for a lone zone), and gain and chmap are still
+recorded and not applied. `src/tests/replay.py` replays capture3's requests and audio
+against the null output, checks the replies and the clock against it, and checks the
+output dump bit for bit (16 → S32_LE) at the frame the start time names.

@@ -142,9 +142,10 @@ int luaopen_raat_stream(lua_State *L)
 	return 1;
 }
 
-/* No wire codec: raat.codecs stays nil, as on the captured 1.1.38 endpoint, so
- * the Core should never send `wire_codec` (spec 11.6). TODO(playback capture
- * against an endpoint advertising codecs): FLAC decode_to_stream if ever needed. */
+/* No wire codec: raat.codecs stays nil, as on the captured 1.1.38 endpoint,
+ * and the Core's setup requests then carry no `wire_codec` (capture3: plain
+ * 16-bit PCM in DATA commands). FLAC would only be needed if codecs were
+ * advertised, which no capture covers. */
 static int c_new(lua_State *L)
 {
 	return luaL_error(L, "codec '%s' is not supported", luaL_optstring(L, 1, "?"));

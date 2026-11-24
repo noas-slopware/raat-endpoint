@@ -2,6 +2,7 @@
 
 #include <alsa/asoundlib.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -13,8 +14,12 @@
 
 #include "third_party/cjson/cJSON.h"
 
-int g_alsa_buffer_ms = 100;
+/* The R26's own stack ran the G20 with a 1764-frame buffer of two 882-frame
+ * periods at 44.1 kHz, i.e. 40 ms in two periods (capture3/hw_params.txt). */
+int g_alsa_buffer_ms = 40;
 int64_t g_extra_delay_ns = 0;
+char *g_null_sink_dir;
+static int sink_seq;
 
 struct output {
 	pdev_t pd;
@@ -50,8 +55,13 @@ struct output {
 	double remote_offset;
 	bool remote_valid;
 
+	/* Device queue after a write (frames), followed smoothly: the RAATCLKR delay. */
+	double qdelay;
+	bool q_valid;
+
 	bool lost;
 	int evfd;
+	int sink_fd; /* null backend: optional dump of what the "DAC" got */
 };
 
 /* ---- busy registry (main thread) ---- */
@@ -86,10 +96,13 @@ static const char *alsa_open(output_t *o)
 	snd_pcm_sw_params_alloca(&sw);
 	const char *fail = "RAAT__OUTPUT_PLUGIN_STATUS_DEVICE_INIT_FAILED";
 
+	/* Widening into a larger container keeps every bit. The R26's stack played
+	 * 16-bit tracks as S32_LE on the G20, whose only container is S32_LE. */
 	snd_pcm_format_t cand[3];
 	int ncand = 0;
 	if (o->bits == 16) {
 		cand[ncand++] = SND_PCM_FORMAT_S16_LE;
+		cand[ncand++] = SND_PCM_FORMAT_S32_LE;
 	} else if (o->bits == 24) {
 		/* packed first: no conversion at all */
 		cand[ncand++] = SND_PCM_FORMAT_S24_3LE;
@@ -118,7 +131,7 @@ static const char *alsa_open(output_t *o)
 		fail = "RAAT__OUTPUT_PLUGIN_STATUS_FORMAT_NOT_SUPPORTED";
 		goto bad;
 	}
-	unsigned buf_us = (unsigned)g_alsa_buffer_ms * 1000u, per_us = buf_us / 4;
+	unsigned buf_us = (unsigned)g_alsa_buffer_ms * 1000u, per_us = buf_us / 2;
 	int dir = 0;
 	snd_pcm_hw_params_set_buffer_time_near(pcm, hw, &buf_us, &dir);
 	dir = 0;
@@ -155,22 +168,35 @@ bad:
 }
 
 /* Wire PCM is packed little-endian signed (spec 13.6). Widening into a larger
- * container keeps every bit. */
+ * container keeps every bit; nothing else is ever done to the samples. */
+static bool container_is_wire(output_t *o)
+{
+	return (o->bits == 16 && o->hwfmt == SND_PCM_FORMAT_S16_LE) ||
+	       (o->bits == 24 && o->hwfmt == SND_PCM_FORMAT_S24_3LE) ||
+	       (o->bits == 32 && o->hwfmt == SND_PCM_FORMAT_S32_LE);
+}
+
 static const uint8_t *to_container(output_t *o, const uint8_t *src, int64_t frames)
 {
-	int wbps = o->bits / 8;
-	if (o->hw_bps == wbps && !(o->bits == 24 && o->hwfmt == SND_PCM_FORMAT_S24_LE))
+	if (container_is_wire(o))
 		return src;
 	int64_t ns = frames * o->channels;
 	uint8_t *d = o->cbuf;
-	if (o->hwfmt == SND_PCM_FORMAT_S32_LE) { /* 24 -> S32_LE (left-justified) */
+	if (o->bits == 16) { /* 16 -> S32_LE, left-justified */
+		for (int64_t i = 0; i < ns; i++, src += 2, d += 4) {
+			d[0] = 0;
+			d[1] = 0;
+			d[2] = src[0];
+			d[3] = src[1];
+		}
+	} else if (o->hwfmt == SND_PCM_FORMAT_S32_LE) { /* 24 -> S32_LE, left-justified */
 		for (int64_t i = 0; i < ns; i++, src += 3, d += 4) {
 			d[0] = 0;
 			d[1] = src[0];
 			d[2] = src[1];
 			d[3] = src[2];
 		}
-	} else { /* 24 -> S24_LE (right-justified, sign-extended) */
+	} else { /* 24 -> S24_LE, right-justified, sign-extended */
 		for (int64_t i = 0; i < ns; i++, src += 3, d += 4) {
 			d[0] = src[0];
 			d[1] = src[1];
@@ -188,8 +214,8 @@ static int alsa_write(output_t *o, const uint8_t *buf, int64_t frames)
 		if (n == -EINTR)
 			continue;
 		if (n == -EPIPE) {
-			/* TODO(playback capture: how the Core reacts to an endpoint underrun):
-			 * the position clock jumps here; we only log and recover. */
+			/* Not seen in capture3 (no Dropout reported). The position
+			 * clock jumps here; we log and recover. */
 			LOGW("[alsa] %s underrun", o->pd.id);
 			if (snd_pcm_prepare(o->pcm) < 0)
 				return -1;
@@ -230,22 +256,44 @@ static int null_open(output_t *o)
 	if (o->tfd < 0)
 		return -1;
 	o->bufsize = (int64_t)o->rate * g_alsa_buffer_ms / 1000;
-	o->period = o->bufsize / 4;
-	o->hw_bps = o->bits / 8;
+	o->period = o->bufsize / 2;
+	/* The fixture may name the container the real device would get, so the
+	 * widening path is exercised and visible in the sink dump. */
+	const char *c = o->pd.container;
+	if (!strcmp(c, "S32_LE") && o->bits <= 32)
+		o->hwfmt = SND_PCM_FORMAT_S32_LE;
+	else if (!strcmp(c, "S24_LE") && o->bits == 24)
+		o->hwfmt = SND_PCM_FORMAT_S24_LE;
+	else
+		o->hwfmt = o->bits == 16 ? SND_PCM_FORMAT_S16_LE
+			 : o->bits == 24 ? SND_PCM_FORMAT_S24_3LE : SND_PCM_FORMAT_S32_LE;
+	o->hw_bps = snd_pcm_format_physical_width(o->hwfmt) / 8;
+	o->sink_fd = -1;
+	if (g_null_sink_dir) {
+		char path[1024];
+		snprintf(path, sizeof path, "%s/sink-%d.raw", g_null_sink_dir, ++sink_seq);
+		o->sink_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	}
 	return 0;
 }
 
+/* Fake DAC position, or -1 before it starts (like a PCM not yet running). */
 static int64_t null_consumed(output_t *o, int64_t t)
 {
 	if (!o->null_t0)
-		return 0;
+		return -1;
 	int64_t c = (int64_t)((double)(t - o->null_t0) / o->nspf);
 	return c > o->written ? o->written : c;
 }
 
 /* Blocks on a timerfd until the fake DAC has room, like a blocking writei. */
-static int null_write(output_t *o, int64_t frames)
+static int null_write(output_t *o, const uint8_t *buf, int64_t frames)
 {
+	if (o->sink_fd >= 0) {
+		size_t len = (size_t)frames * (size_t)o->hw_bps * (size_t)o->channels;
+		if (write(o->sink_fd, buf, len) != (ssize_t)len)
+			return -1;
+	}
 	if (!o->null_t0 && o->written + frames >= o->bufsize)
 		o->null_t0 = now_ns(); /* "start threshold" reached */
 	if (!o->null_t0)
@@ -278,9 +326,18 @@ static void clock_update(output_t *o, int64_t pos)
 		o->off = meas;
 		o->clk_valid = true;
 	} else {
-		/* TODO(playback capture: RAATCLKQ rate and the jitter the Core tolerates):
-		 * a first-order filter over period-granular position readings. */
+		/* The Core reads the clock in bursts of three RAATCLKQ 5 ms apart,
+		 * every 2 s, from setup until stop (capture3); RTTs were 0.2-0.7 ms.
+		 * A first-order filter over period-granular readings keeps the
+		 * clock smooth at that resolution. */
 		o->off += (meas - o->off) / 16.0;
+	}
+	double q = (double)(o->written - pos);
+	if (!o->q_valid) {
+		o->qdelay = q;
+		o->q_valid = true;
+	} else {
+		o->qdelay += (q - o->qdelay) / 16.0;
 	}
 }
 
@@ -333,7 +390,7 @@ static void *output_thread(void *arg)
 		if (o->pcm)
 			rc = alsa_write(o, to_container(o, o->pbuf, n), n);
 		else
-			rc = null_write(o, n);
+			rc = null_write(o, to_container(o, o->pbuf, n), n);
 
 		pthread_mutex_lock(&o->mu);
 		if (rc < 0) {
@@ -355,7 +412,8 @@ static void *output_thread(void *arg)
 
 /* ---- API ---- */
 
-output_t *output_open(const pdev_t *pd, int rate, int bits, int channels, const char **status)
+output_t *output_open(const pdev_t *pd, int rate, int bits, int channels, int64_t clock_base,
+		      const char **status)
 {
 	if (!pdev_supports(pd, rate, bits, channels)) {
 		*status = "RAAT__OUTPUT_PLUGIN_STATUS_FORMAT_NOT_SUPPORTED";
@@ -376,6 +434,7 @@ output_t *output_open(const pdev_t *pd, int rate, int bits, int channels, const 
 	o->wire_bpf = bits / 8 * channels;
 	o->nspf = 1e9 / rate;
 	o->tfd = -1;
+	o->sink_fd = -1;
 	o->evfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	if (pd->backend == BACKEND_ALSA) {
 		*status = alsa_open(o);
@@ -389,8 +448,11 @@ output_t *output_open(const pdev_t *pd, int rate, int bits, int channels, const 
 	o->cbuf = xmalloc((size_t)o->period * (size_t)o->channels * 4);
 	pthread_mutex_init(&o->mu, NULL);
 	pthread_cond_init(&o->cv, NULL);
-	o->L0 = now_ns();
-	o->off = 0;
+	/* The clock starts at 0 with the first setup and resumes from where it
+	 * stopped on the next one: capture3 shows ~0.05 s right after the first
+	 * setup and, after a 1 s teardown gap, a value that had paused (spec 13.7). */
+	o->L0 = clock_base;
+	o->off = (double)clock_base - (double)now_ns();
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);
 	pthread_attr_setstacksize(&attr, 128 * 1024);
@@ -408,6 +470,8 @@ fail:
 		snd_pcm_close(o->pcm);
 	if (o->tfd >= 0)
 		close(o->tfd);
+	if (o->sink_fd >= 0)
+		close(o->sink_fd);
 	close(o->evfd);
 	free(o->pbuf);
 	free(o->cbuf);
@@ -416,10 +480,11 @@ fail:
 	return NULL;
 }
 
-void output_close(output_t *o)
+int64_t output_close(output_t *o)
 {
 	if (!o)
-		return;
+		return 0;
+	int64_t clock_end = output_local_time(o);
 	pthread_mutex_lock(&o->mu);
 	o->quit = true;
 	pthread_cond_broadcast(&o->cv);
@@ -439,6 +504,8 @@ void output_close(output_t *o)
 	}
 	if (o->tfd >= 0)
 		close(o->tfd);
+	if (o->sink_fd >= 0)
+		close(o->sink_fd);
 	close(o->evfd);
 	pthread_mutex_destroy(&o->mu);
 	pthread_cond_destroy(&o->cv);
@@ -446,6 +513,7 @@ void output_close(output_t *o)
 	free(o->cbuf);
 	pdev_clear(&o->pd);
 	free(o);
+	return clock_end;
 }
 
 int output_start(output_t *o, int64_t time_ns, int64_t stream_sample, stream_t *st, const char **err)
@@ -461,9 +529,10 @@ int output_start(output_t *o, int64_t time_ns, int64_t stream_sample, stream_t *
 		*err = "RAAT__OUTPUT_PLUGIN_STATUS_INVALID_STATE";
 		return -1;
 	}
-	/* TODO(playback capture: `start` request `time` vs `min_offset`): `time` is
-	 * taken as an instant in the get_local_time domain (spec 13.4.1); frame k of
-	 * the device timeline plays at L0 + k * ns_per_frame. */
+	/* time_ns is in the get_local_time domain. In capture3 the Core never sent
+	 * `time`: the script used get_local_time + min_offset, and min_offset was
+	 * the last RAATCLKR delay + 20 ms. Frame k of the device timeline plays at
+	 * L0 + k * ns_per_frame, so the stream starts at frame ceil((t - L0)/nspf). */
 	stream_ref(st);
 	if (o->st) {
 		stream_end_read(o->st);
@@ -514,18 +583,23 @@ int64_t output_local_time(output_t *o)
 
 int64_t output_delay_ns(output_t *o)
 {
-	/* TODO(playback capture: RAATCLKR delay the Core expects): local time is the
-	 * DAC play position, so the delay reported is the device queue (buffer) plus
-	 * any configured extra (sync_offset_ns in the reference). */
-	return (int64_t)llround((double)o->bufsize * o->nspf) + g_extra_delay_ns;
+	/* Local time is the DAC play position, so the delay is how far ahead of it
+	 * a frame written now lands: the device queue right after a write. The R26
+	 * reported 49.09-49.21 ms for a 40 ms ALSA buffer (USB in flight on top),
+	 * steady from setup on, and the Core set min_offset = delay + 20 ms. */
+	pthread_mutex_lock(&o->mu);
+	double q = o->q_valid ? o->qdelay : (double)o->bufsize;
+	pthread_mutex_unlock(&o->mu);
+	return (int64_t)llround(q * o->nspf) + g_extra_delay_ns;
 }
 
 void output_set_remote_time(output_t *o, double offset_ns, bool reset)
 {
-	/* TODO(playback capture: `sync` request host/port for a lone zone): the
-	 * reference feeds this to drift correction, which inserts or drops dithered
-	 * samples. Bit-perfect is a hard rule here, so the offset is recorded and
-	 * nothing is ever inserted or dropped. Multi-zone sync needs this designed. */
+	/* A lone zone gets no `sync` at all (capture3): the Core paces itself to
+	 * this clock. sync only matters for grouped zones, which no capture covers
+	 * yet. The reference feeds the offset to drift correction, which inserts or
+	 * drops dithered samples; bit-perfect is a hard rule here, so the offset is
+	 * recorded and nothing is ever inserted or dropped. */
 	pthread_mutex_lock(&o->mu);
 	if (reset || !o->remote_valid)
 		LOGD("[output] remote clock %s: offset %.3f ms", reset ? "reset" : "set", offset_ns / 1e6);
@@ -552,11 +626,19 @@ char *output_signal_path_json(output_t *o)
 	cJSON *root = cJSON_CreateObject();
 	cJSON *arr = cJSON_AddArrayToObject(root, "signal_path");
 	cJSON *e = cJSON_CreateObject();
+	/* Shape as sent by the R26 (capture3): alsa_device is the card info. */
 	cJSON_AddStringToObject(e, "type", "output");
 	cJSON_AddStringToObject(e, "method", o->pcm ? "alsa" : "null");
 	cJSON_AddStringToObject(e, "quality", "lossless");
-	if (o->pcm)
-		cJSON_AddStringToObject(e, "alsa_device", o->pd.id);
+	cJSON *ad = cJSON_AddObjectToObject(e, "alsa_device");
+	cJSON_AddStringToObject(ad, "name", o->pd.name);
+	cJSON_AddStringToObject(ad, "id", o->pd.card_id);
+	cJSON_AddStringToObject(ad, "longname", o->pd.longname);
+	cJSON_AddStringToObject(ad, "components", o->pd.components);
+	if (o->pd.usb_id[0])
+		cJSON_AddStringToObject(ad, "usbid", o->pd.usb_id);
+	cJSON_AddStringToObject(ad, "driver", o->pd.driver);
+	cJSON_AddStringToObject(ad, "mixername", o->pd.mixername);
 	cJSON_AddItemToArray(arr, e);
 	char *s = cJSON_PrintUnformatted(root);
 	cJSON_Delete(root);
