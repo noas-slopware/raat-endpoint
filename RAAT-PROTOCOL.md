@@ -1534,3 +1534,24 @@ the next device frame, late by that much, and the warning is logged. Nothing is
 dropped, at the cost of the Core's position bookkeeping being off by those frames, which
 on a later resume in the window means repeating them. The output thread also asks for
 `SCHED_RR` 95.
+
+## 15. Findings from running against a real Core (2026-11-24)
+
+Native endpoint on the Gustard R26 in place of RoonBridge, same Core, driven through the Roon API.
+
+- **Announce.** RoonBridge's manager multicasts a SOOD `Q` to 239.255.90.90:9003 about 5 s after it
+  starts (and on interface changes), carrying the same keys as its `R` reply: `config_version`,
+  `service_id`, `_tid`, `machine_id`, `unique_id`, `machine_name`, `os_version`, `is_dev`,
+  `protocol_version`, `raat_version`, `tcp_port`; `vendor`/`model` are absent when unset. The Core
+  answers with a burst of `R` packets and connects to `tcp_port`. Without the announce, a Core that saw
+  the endpoint vanish without closing its connections never comes back: it stops querying.
+- **Identity.** The Core keys the enabled device on `unique_id` *and* `machine_id`. With RoonBridge's
+  `unique_id` but a different `machine_id` it sends `enumerate_devices` and never `enable_device`.
+  RoonBridge's `machine_id` comes from `$ROON_ID_DIR` or `$HOME/.rmembid`, else the DMI product UUID
+  or a NIC address (`MachineId.cs`), not `/etc/machine-id`; its RAATServer log prints it. To take over
+  an existing zone, an endpoint must reuse `unique_id`, `machine_id` and the device config's
+  `unique_id`; with those the Core sends `enumerate_devices` and `enable_device` back to back.
+- **MQA.** MQA files arrive as `{"sample_subtype":"mqa","mqa_original_sample_rate":44100}` (also
+  `mqa_core`). RoonBridge accepts `none`, `mqa` and `mqa_core` and plays the samples unchanged. Refusing
+  makes the Core retry `setup` five times within ~0.2 s and then stop the zone.
+- **Network blip.** A 5 s link drop keeps the Core's TCP connections; nothing reconnects.
