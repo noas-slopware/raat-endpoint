@@ -193,7 +193,7 @@ int sood_start(const char *bind_addr, int port, bool join_multicast, const struc
 	struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons((uint16_t)port) };
 	if (inet_pton(AF_INET, bind_addr, &sa.sin_addr) != 1 ||
 	    bind(fd, (struct sockaddr *)&sa, sizeof sa) < 0) {
-		LOGW("[sood] couldn't bind to %s:%d: %s", bind_addr, port, strerror(errno));
+		LOGW("[sood] bind %s:%d failed: %s", bind_addr, port, strerror(errno));
 		close(fd);
 		return -1;
 	}

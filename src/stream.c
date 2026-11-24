@@ -153,7 +153,7 @@ int stream_write(stream_t *s, int64_t sample, double gain, double peak, const ui
 			s->overrun_count++;
 			s->samples_overrun += n;
 			pthread_mutex_unlock(&s->mu);
-			LOGW("[stream] buffer overrun. discarding %lld samples", (long long)n);
+			LOGW("[stream] ring full, %lld samples thrown away", (long long)n);
 			return 0;
 		}
 		ring_zero(s, s->hi, gap);
@@ -164,7 +164,7 @@ int stream_write(stream_t *s, int64_t sample, double gain, double peak, const ui
 	if (n > room) {
 		s->overrun_count++;
 		s->samples_overrun += n - room;
-		LOGW("[stream] buffer overrun. discarding %lld samples", (long long)(n - room));
+		LOGW("[stream] ring full, %lld samples thrown away", (long long)(n - room));
 		n = room;
 	}
 	if (n > 0) {
@@ -233,5 +233,5 @@ void stream_read(stream_t *s, uint8_t *dst, int64_t n)
 	}
 	pthread_mutex_unlock(&s->mu);
 	if (got < n)
-		LOGT("[stream] dropout of %lld samples", (long long)(n - got));
+		LOGT("[stream] short by %lld samples, padded with silence", (long long)(n - got));
 }

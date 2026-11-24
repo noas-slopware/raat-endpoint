@@ -302,7 +302,7 @@ static void *output_thread(void *arg)
 				s0 += o->written - k;
 				k = o->written;
 			}
-			LOGI("[output] starting playback at frame %lld (now %lld), streamsample=%lld",
+			LOGI("[output] stream begins at device frame %lld (written so far %lld), first sample %lld",
 			     (long long)k, (long long)o->written, (long long)s0);
 			stream_begin_read(o->st, s0);
 			o->start_idx = k;

@@ -35,7 +35,7 @@ static void on_out_event(io_watch_t *w, uint32_t ev)
 		/* spurious wakeup */
 	}
 	if (d->out && output_lost(d->out)) {
-		LOGW("[watch/alsa] device %s lost", d->pd.id);
+		LOGW("[output] %s went away", d->pd.id);
 		dev_output_release(d, true, NULL);
 		manager_refresh_devices();
 	}

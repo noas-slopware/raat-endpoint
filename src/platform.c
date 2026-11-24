@@ -267,7 +267,7 @@ static void probe_formats(pdev_t *d)
 				if (snd_pcm_hw_params_set_channels(pcm, hw, ch) < 0)
 					break;
 				if (snd_pcm_hw_params_test_rate(pcm, hw, std_rates[ri], 0) == 0) {
-					LOGD("[alsa] [%s] supports PCM format %u/%d/%u (%s)", d->id, std_rates[ri],
+					LOGD("[alsa] %s takes %u/%d/%u as %s", d->id, std_rates[ri],
 					     containers[ci].bits, ch, snd_pcm_format_name(containers[ci].f));
 					add_fmt(d, (int)std_rates[ri], containers[ci].bits, (int)ch);
 				}

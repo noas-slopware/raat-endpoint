@@ -169,7 +169,7 @@ static void ka_tick(ltimer_t *t)
 {
 	llconn_t *c = t->ud;
 	if (now_ms() - c->last_rx_ms > (int64_t)c->ka_timeout) {
-		LOGW("[%s] client %s:%d timed out", c->tag, c->peer_ip, c->peer_port);
+		LOGW("[%s] no traffic from %s:%d within the keepalive timeout", c->tag, c->peer_ip, c->peer_port);
 		ll_close(c, "keepalive timeout");
 		return;
 	}
