@@ -83,9 +83,18 @@ static int o_setup(lua_State *L)
 	char type[16];
 	strlcpy0(type, lua_isstring(L, -1) ? lua_tostring(L, -1) : "", sizeof type);
 	lua_pop(L, 1);
-	/* The Core sends sample_subtype "none" (capture3); MQA is not offered. */
+	/*
+	 * sample_subtype: "none", "mqa" or "mqa_core", as RoonBridge accepts
+	 * (anything else is an error there too). MQA content is ordinary PCM on
+	 * the wire and is played unchanged, so the DAC can detect it itself; the
+	 * Core sends it with mqa_original_sample_rate for MQA files.
+	 */
 	lua_getfield(L, 1, "sample_subtype");
-	bool plain = lua_isnil(L, -1) || (lua_isstring(L, -1) && !strcmp(lua_tostring(L, -1), "none"));
+	const char *sub = lua_isstring(L, -1) ? lua_tostring(L, -1) : NULL;
+	bool plain = lua_isnil(L, -1) ||
+		     (sub && (!strcmp(sub, "none") || !strcmp(sub, "mqa") || !strcmp(sub, "mqa_core")));
+	if (sub && strcmp(sub, "none"))
+		LOGI("[output] setup subtype %s", sub);
 	lua_pop(L, 1);
 	bool ok = true;
 	int rate = field_num(L, 1, "sample_rate", &ok);
@@ -100,8 +109,10 @@ static int o_setup(lua_State *L)
 
 	const char *status = NULL;
 	output_t *o = NULL;
-	if (!ok || !plain || strcmp(type, "pcm"))
+	if (!ok || !plain || strcmp(type, "pcm")) {
+		LOGW("[output] setup refused: type %s, plain %d, fields ok %d", type, plain, ok);
 		status = "RAAT__OUTPUT_PLUGIN_STATUS_FORMAT_NOT_SUPPORTED"; /* PCM only, no DSD */
+	}
 	else
 		o = output_open(&d->pd, rate, bits, ch, d->clock_carry, &status);
 	if (!o) {

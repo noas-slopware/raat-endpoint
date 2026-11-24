@@ -122,6 +122,7 @@ static const char *alsa_open(output_t *o)
 		if (snd_pcm_hw_params_test_format(pcm, hw, cand[i]) == 0)
 			break;
 	if (i == ncand || snd_pcm_hw_params_set_format(pcm, hw, cand[i]) < 0) {
+		LOGW("[alsa] %s: no sample format for %d-bit", o->pd.id, o->bits);
 		fail = "RAAT__OUTPUT_PLUGIN_STATUS_FORMAT_NOT_SUPPORTED";
 		goto bad;
 	}
@@ -129,6 +130,8 @@ static const char *alsa_open(output_t *o)
 	o->hw_bps = snd_pcm_format_physical_width(o->hwfmt) / 8;
 	if (snd_pcm_hw_params_set_channels(pcm, hw, (unsigned)o->channels) < 0 ||
 	    snd_pcm_hw_params_set_rate(pcm, hw, (unsigned)o->rate, 0) < 0) {
+		LOGW("[alsa] %s: %d ch / %d Hz refused with %s", o->pd.id, o->channels, o->rate,
+		     snd_pcm_format_name(o->hwfmt));
 		fail = "RAAT__OUTPUT_PLUGIN_STATUS_FORMAT_NOT_SUPPORTED";
 		goto bad;
 	}
@@ -432,6 +435,7 @@ output_t *output_open(const pdev_t *pd, int rate, int bits, int channels, int64_
 		      const char **status)
 {
 	if (!pdev_supports(pd, rate, bits, channels)) {
+		LOGW("[output] %s: %d/%d/%d is not in the device's format list", pd->id, rate, bits, channels);
 		*status = "RAAT__OUTPUT_PLUGIN_STATUS_FORMAT_NOT_SUPPORTED";
 		return NULL;
 	}
