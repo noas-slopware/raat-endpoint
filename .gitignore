@@ -1,0 +1,6 @@
+*.pcap
+capture*/
+decoded/
+src/
+native/
+r26cap
