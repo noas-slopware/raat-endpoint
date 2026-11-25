@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* `buffer` global module (spec 7, 13.10): byte buffers with 0-based offsets,
  * bounds-checked integer and float accessors in both byte orders. */
 #include "session.h"

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 /*
  * r26cap: minimal packet capture for a box without tcpdump.
  * usage: r26cap <ifname> <peer-ipv4> <seconds> <out.pcap>

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* raat-endpoint: a native RAAT (Roon Ready) endpoint for small Linux boxes. */
 #include "common.h"
 #include "device.h"

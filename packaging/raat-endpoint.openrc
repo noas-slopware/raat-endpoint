@@ -1,4 +1,5 @@
 #!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-3.0-or-later
 
 description="Native RAAT (Roon Ready) audio endpoint"
 supervisor=supervise-daemon

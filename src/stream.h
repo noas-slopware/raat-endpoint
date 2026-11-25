@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* The sample ring between the session script (writer, main thread) and the
  * output thread (reader). Addressed by absolute stream sample (frame) index,
  * as the script's stream:write(stream_sample, ...) is (spec 7, 13.5). */

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "manager.h"
 #include "sood.h"
 #include "device.h"

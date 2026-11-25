@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* "LL" framing (spec 5.1): u32 BE total_len (8 + body), u32 BE type, body. */
 #ifndef RAAT_LL_H
 #define RAAT_LL_H

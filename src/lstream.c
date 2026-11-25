@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* `stream` and `codec` global modules (spec 7, 13.10). */
 #include "session.h"
 #include "stream.h"

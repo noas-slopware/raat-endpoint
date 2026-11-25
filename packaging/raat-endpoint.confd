@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # the ALSA thread runs SCHED_RR 95
 rc_ulimit="-r 95"
 # 64 MiB, as MemoryMax=64M in the systemd unit (cgroup v2)

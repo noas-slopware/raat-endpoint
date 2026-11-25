@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* Unit tests for the stream ring's CHMAP handling (stream_write with a channel
  * mask). Built and run by `make test`. */
 #include "../stream.h"

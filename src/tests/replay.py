@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Replay test for raat-endpoint, loopback only.
 
 usage: replay.py [--qemu qemu-arm] <raat-endpoint binary>

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* Output device: an audio thread that keeps the DAC fed from setup to teardown
  * (silence until start, then the stream), plus the playback-position clock that
  * raat.output.get_local_time reports (spec 7, 8.4, 13.4.1). */

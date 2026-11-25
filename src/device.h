@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* A manager-side output device and the state shared by its sessions. */
 #ifndef RAAT_DEVICE_H
 #define RAAT_DEVICE_H

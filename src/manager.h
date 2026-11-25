@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* The RAAT manager: device list, JSON-RPC over LL framing on TCP 9200-9250
  * (spec 5.2, 10, 13.1), persistent identity and per-device config (spec 5.5). */
 #ifndef RAAT_MANAGER_H

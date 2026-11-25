@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* Shared helpers: logging, clocks, small utilities. */
 #ifndef RAAT_COMMON_H
 #define RAAT_COMMON_H

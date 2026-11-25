@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* raat.output: the output plugin surface the scripts drive (spec 7, 13.4.1,
  * 13.10). One active setup per device, identified by an integer token. */
 #include "session.h"

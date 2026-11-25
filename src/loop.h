@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* Single-threaded epoll event loop with a timer heap and a deferred-task queue.
  *
  * Objects that own an io_watch must be freed through loop_defer() (or after

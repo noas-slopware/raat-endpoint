@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* Platform layer: which outputs exist and what PCM formats they take natively.
  * Two sources: ALSA (cards, playback PCMs, hw_params probing) or a fixture JSON
  * file (tests; outputs then use the paced null backend). */

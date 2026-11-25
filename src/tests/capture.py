@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Capture parsing for the replay test: TCP reassembly that tolerates loss.
 
 The capture tool on the endpoint drops packets now and then. Streams are

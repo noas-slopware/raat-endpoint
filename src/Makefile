@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # raat-endpoint
 #   make            host build (system alsa-lib), output in build/host/
 #   make armhf      static armhf build with the Linaro 8.2 toolchain, build/armhf/

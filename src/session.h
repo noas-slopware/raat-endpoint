@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* One Lua 5.3 VM per device-server connection, hosting the Core's scripts
  * (spec 3, 5.3, 7, 13.10). Everything runs on the main event loop. */
 #ifndef RAAT_SESSION_H

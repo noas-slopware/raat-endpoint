@@ -63,3 +63,8 @@ rc-update add raat-endpoint default && rc-service raat-endpoint start
 
 The identity files are what make the Core treat it as the same zone. Keep a copy of
 `/var/lib/raat-endpoint/Settings`.
+
+## License
+
+GPL-3.0-or-later (`LICENSE`; SPDX headers in the files). The vendored Lua 5.3.6
+(`src/third_party/lua-5.3.6`) and cJSON (`src/third_party/cjson`) keep their own MIT licenses.

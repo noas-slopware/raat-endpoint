@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "sood.h"
 #include "ll.h"
 #include "loop.h"

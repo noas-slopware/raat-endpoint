@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* A small luv-compatible `uv` module on the main epoll loop.
  *
  * It covers what the Core's scripts call (spec 13.10): TCP listen/accept/read,

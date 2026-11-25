@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* SOOD discovery (spec 4): answers 'Q' queries for the RAAT service id with a
  * unicast 'R', and announces itself with a multicast 'Q' at start and when the
  * interface addresses change (with multicast enabled only). */
