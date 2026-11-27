@@ -1,0 +1,15 @@
+[Unit]
+Description=RAATflector (L3 VPN SOOD reflector server)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Bind to your Tailscale IP and set --core-ip to the Core's Tailscale IP if remote
+# clients do not have a subnet route to the LAN.
+ExecStart=/usr/local/bin/raatflector --bind 0.0.0.0 --port 9004
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

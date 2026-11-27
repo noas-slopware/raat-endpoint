@@ -55,7 +55,7 @@ static void settings_path(char *out, size_t n, const char *name)
 
 static void device_config_path(char *out, size_t n, const char *id)
 {
-	char safe[128];
+	char safe[160];
 	size_t k = 0;
 	for (const char *p = id; *p && k + 1 < sizeof safe; p++)
 		safe[k++] = (char)((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
@@ -63,14 +63,14 @@ static void device_config_path(char *out, size_t n, const char *id)
 				   ? *p
 				   : '_');
 	safe[k] = 0;
-	char name[160];
+	char name[192];
 	snprintf(name, sizeof name, "device_%s.json", safe);
 	settings_path(out, n, name);
 }
 
 static void save_device_config(mdev_t *d)
 {
-	char path[1200];
+	char path[1400];
 	device_config_path(path, sizeof path, d->pd.id);
 	char *t = cJSON_Print(d->config);
 	if (file_write(path, t, strlen(t)) < 0)
@@ -84,7 +84,8 @@ static cJSON *default_config(mdev_t *d)
 	cJSON_AddStringToObject(c, "unique_id", d->unique_id);
 	cJSON_AddObjectToObject(c, "external_config");
 	cJSON *o = cJSON_AddObjectToObject(c, "output");
-	cJSON_AddStringToObject(o, "dsd_mode", "none"); /* PCM only (spec 11.3) */
+	const char *dm = d->pd.has_native_dsd ? "native" : (d->pd.has_dop ? "dop" : "none");
+	cJSON_AddStringToObject(o, "dsd_mode", dm);
 	cJSON_AddStringToObject(o, "type", "alsa");
 	cJSON_AddStringToObject(o, "device", d->pd.id);
 	cJSON_AddStringToObject(o, "name", d->pd.name);
@@ -110,7 +111,7 @@ static void adopt_config(mdev_t *d, cJSON *cfg)
 
 static void load_device_config(mdev_t *d)
 {
-	char path[1200];
+	char path[1400];
 	device_config_path(path, sizeof path, d->pd.id);
 	char *t = file_read(path, NULL);
 	cJSON *c = t ? cJSON_Parse(t) : NULL;
@@ -611,10 +612,25 @@ void manager_shutdown(void)
 			send_status(s->conn, s->rid, true, "Canceled");
 		sub_free(s);
 	}
-	for (mdev_t *d = M.devs; d; d = d->next)
+	while (M.devs) {
+		mdev_t *d = M.devs;
+		M.devs = d->next;
 		device_stop(d);
+		pdev_clear(&d->pd);
+		cJSON_Delete(d->config);
+		free(d);
+	}
+	loop_timer_stop(&M.debounce);
+	int wfd = M.ww.fd;
+	loop_io_del(&M.ww);
+	if (wfd >= 0)
+		close(wfd);
 	int fd = M.lw.fd;
 	loop_io_del(&M.lw);
 	if (fd >= 0)
 		close(fd);
+	memset(&M, 0, sizeof M);
+	M.lw.fd = -1;
+	M.ww.fd = -1;
+	M.watch_fd = -1;
 }

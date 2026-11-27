@@ -14,8 +14,10 @@ typedef struct stream {
 
 	char sample_type[16];
 	int rate, bits, channels;
-	int bpf; /* bytes per frame on the wire */
-	int64_t capacity;
+	int bpf;              /* bytes per ring slot (1 frame for PCM, 8 bits/ch for DSD) */
+	int sample_div;       /* 1 for PCM, 8 for DSD */
+	uint8_t silence_byte; /* 0x00 for PCM, 0x69 for DSD */
+	int64_t capacity;     /* ring slots */
 	uint8_t *data;
 
 	bool empty;

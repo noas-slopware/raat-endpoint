@@ -16,9 +16,10 @@ extern int64_t g_extra_delay_ns;
 extern char *g_null_sink_dir; /* tests: null backend writes sink-<n>.raw here */
 
 /* Opens the device at exactly this format and starts the thread (silence).
+ * sample_type is "pcm" or "dsd"; dsd_mode is DSD_MODE_* when sample_type is "dsd".
  * On failure returns NULL and sets *status to a RAAT__OUTPUT_PLUGIN_STATUS_* name. */
-output_t *output_open(const pdev_t *pd, int rate, int bits, int channels, int64_t clock_base,
-		      const char **status);
+output_t *output_open(const pdev_t *pd, const char *sample_type, int rate, int bits, int channels,
+		      int dsd_mode, int64_t clock_base, const char **status);
 /* Returns the local time at close, the base for the device's next setup. */
 int64_t output_close(output_t *o);
 

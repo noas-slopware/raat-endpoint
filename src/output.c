@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "output.h"
+#include "pw_backend.h"
 
 #include <alsa/asoundlib.h>
 #include <errno.h>
@@ -25,14 +26,21 @@ static int sink_seq;
 
 struct output {
 	pdev_t pd;
+	bool is_dsd;
+	int dsd_mode;         /* DSD_MODE_* */
+	int dsd_bpf_bits;     /* DSD 1-bit samples per ALSA frame (32/16/8 native, 16 DoP) */
+	uint8_t dop_marker;   /* alternates 0x05 / 0xFA per PCM frame in DoP mode */
+	uint8_t silence_byte; /* 0x00 for PCM, 0x69 for DSD */
 	int rate, bits, channels;
 	int wire_bpf;
-	double nspf; /* ns per frame */
+	double nspf; /* ns per device frame */
 
 	/* ALSA */
 	snd_pcm_t *pcm;
 	snd_pcm_format_t hwfmt;
 	int hw_bps; /* container bytes per sample */
+	/* PipeWire */
+	pw_output_t *pw;
 	/* null backend: a paced fake DAC with the same buffer model */
 	int tfd;
 	int64_t null_t0;
@@ -100,9 +108,25 @@ static const char *alsa_open(output_t *o)
 
 	/* Widening into a larger container keeps every bit. The R26's stack played
 	 * 16-bit tracks as S32_LE on the G20, whose only container is S32_LE. */
-	snd_pcm_format_t cand[3];
+	snd_pcm_format_t cand[6];
 	int ncand = 0;
-	if (o->bits == 16) {
+	unsigned alsa_rate = (unsigned)o->rate;
+	if (o->is_dsd) {
+		if (o->dsd_mode == DSD_MODE_NATIVE) {
+			cand[ncand++] = SND_PCM_FORMAT_DSD_U32_BE;
+			cand[ncand++] = SND_PCM_FORMAT_DSD_U32_LE;
+			cand[ncand++] = SND_PCM_FORMAT_DSD_U16_BE;
+			cand[ncand++] = SND_PCM_FORMAT_DSD_U16_LE;
+			cand[ncand++] = SND_PCM_FORMAT_DSD_U8;
+		} else if (o->dsd_mode == DSD_MODE_DOP) {
+			cand[ncand++] = SND_PCM_FORMAT_S24_3LE;
+			cand[ncand++] = SND_PCM_FORMAT_S32_LE;
+			cand[ncand++] = SND_PCM_FORMAT_S24_LE;
+		} else {
+			fail = "RAAT__OUTPUT_PLUGIN_STATUS_FORMAT_NOT_SUPPORTED";
+			goto bad;
+		}
+	} else if (o->bits == 16) {
 		cand[ncand++] = SND_PCM_FORMAT_S16_LE;
 		cand[ncand++] = SND_PCM_FORMAT_S32_LE;
 	} else if (o->bits == 24) {
@@ -119,19 +143,43 @@ static const char *alsa_open(output_t *o)
 	if (snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED) < 0)
 		goto bad;
 	int i;
-	for (i = 0; i < ncand; i++)
-		if (snd_pcm_hw_params_test_format(pcm, hw, cand[i]) == 0)
+	for (i = 0; i < ncand; i++) {
+		if (snd_pcm_hw_params_test_format(pcm, hw, cand[i]) != 0)
+			continue;
+		if (o->is_dsd) {
+			int w = snd_pcm_format_physical_width(cand[i]);
+			unsigned r = o->dsd_mode == DSD_MODE_NATIVE ? (unsigned)o->rate / (unsigned)w
+								    : (unsigned)o->rate / 16u;
+			snd_pcm_hw_params_t *tmp;
+			snd_pcm_hw_params_alloca(&tmp);
+			snd_pcm_hw_params_copy(tmp, hw);
+			if (snd_pcm_hw_params_set_format(pcm, tmp, cand[i]) == 0 &&
+			    snd_pcm_hw_params_set_channels(pcm, tmp, (unsigned)o->channels) == 0 &&
+			    snd_pcm_hw_params_test_rate(pcm, tmp, r, 0) == 0) {
+				alsa_rate = r;
+				break;
+			}
+		} else {
 			break;
+		}
+	}
 	if (i == ncand || snd_pcm_hw_params_set_format(pcm, hw, cand[i]) < 0) {
-		LOGW("[alsa] %s: no sample format for %d-bit", o->pd.id, o->bits);
+		LOGW("[alsa] %s: no sample format for %s %d-bit", o->pd.id,
+		     o->is_dsd ? "dsd" : "pcm", o->bits);
 		fail = "RAAT__OUTPUT_PLUGIN_STATUS_FORMAT_NOT_SUPPORTED";
 		goto bad;
 	}
 	o->hwfmt = cand[i];
 	o->hw_bps = snd_pcm_format_physical_width(o->hwfmt) / 8;
+	if (o->is_dsd) {
+		o->dsd_bpf_bits = o->dsd_mode == DSD_MODE_NATIVE ? o->hw_bps * 8 : 16;
+		o->wire_bpf = (o->dsd_bpf_bits / 8) * o->channels;
+		o->nspf = 1e9 / (double)alsa_rate;
+		o->dop_marker = 0x05;
+	}
 	if (snd_pcm_hw_params_set_channels(pcm, hw, (unsigned)o->channels) < 0 ||
-	    snd_pcm_hw_params_set_rate(pcm, hw, (unsigned)o->rate, 0) < 0) {
-		LOGW("[alsa] %s: %d ch / %d Hz refused with %s", o->pd.id, o->channels, o->rate,
+	    snd_pcm_hw_params_set_rate(pcm, hw, alsa_rate, 0) < 0) {
+		LOGW("[alsa] %s: %d ch / %u Hz refused with %s", o->pd.id, o->channels, alsa_rate,
 		     snd_pcm_format_name(o->hwfmt));
 		fail = "RAAT__OUTPUT_PLUGIN_STATUS_FORMAT_NOT_SUPPORTED";
 		goto bad;
@@ -147,8 +195,9 @@ static const char *alsa_open(output_t *o)
 	}
 	unsigned rate = 0;
 	snd_pcm_hw_params_get_rate(hw, &rate, &dir);
-	if ((int)rate != o->rate) {
-		LOGE("[alsa] %s: got rate %u for %d; refusing (no resampling)", o->pd.id, rate, o->rate);
+	if (rate != alsa_rate) {
+		LOGE("[alsa] %s: got rate %u for %u; refusing (no resampling)", o->pd.id, rate,
+		     alsa_rate);
 		fail = "RAAT__OUTPUT_PLUGIN_STATUS_FORMAT_NOT_SUPPORTED";
 		goto bad;
 	}
@@ -181,8 +230,63 @@ static bool container_is_wire(output_t *o)
 	       (o->bits == 32 && o->hwfmt == SND_PCM_FORMAT_S32_LE);
 }
 
+static const uint8_t *to_container_dsd(output_t *o, const uint8_t *src, int64_t frames)
+{
+	int ch = o->channels;
+	uint8_t *d = o->cbuf;
+	if (o->dsd_mode == DSD_MODE_NATIVE) {
+		if (o->hwfmt == SND_PCM_FORMAT_DSD_U8)
+			return src;
+		int bpc = o->hw_bps; /* 2 or 4 bytes per channel per ALSA frame */
+		bool le = (o->hwfmt == SND_PCM_FORMAT_DSD_U32_LE ||
+			   o->hwfmt == SND_PCM_FORMAT_DSD_U16_LE);
+		for (int64_t f = 0; f < frames; f++, src += bpc * ch) {
+			for (int c = 0; c < ch; c++, d += bpc) {
+				if (le) {
+					for (int k = 0; k < bpc; k++)
+						d[k] = src[(bpc - 1 - k) * ch + c];
+				} else {
+					for (int k = 0; k < bpc; k++)
+						d[k] = src[k * ch + c];
+				}
+			}
+		}
+		return o->cbuf;
+	}
+	/* DoP v1.1: 2 wire DSD bytes per channel per 24/32-bit PCM frame + 0x05/0xFA marker. */
+	for (int64_t f = 0; f < frames; f++, src += 2 * ch) {
+		uint8_t m = o->dop_marker;
+		o->dop_marker = (m == 0x05) ? 0xFA : 0x05;
+		for (int c = 0; c < ch; c++) {
+			uint8_t b0 = src[c];       /* earlier 8 DSD bits (MSB) */
+			uint8_t b1 = src[ch + c];  /* later 8 DSD bits (LSB) */
+			if (o->hwfmt == SND_PCM_FORMAT_S24_3LE) {
+				d[0] = b1;
+				d[1] = b0;
+				d[2] = m;
+				d += 3;
+			} else if (o->hwfmt == SND_PCM_FORMAT_S32_LE) {
+				d[0] = 0;
+				d[1] = b1;
+				d[2] = b0;
+				d[3] = m;
+				d += 4;
+			} else { /* S24_LE, right-justified */
+				d[0] = b1;
+				d[1] = b0;
+				d[2] = m;
+				d[3] = 0;
+				d += 4;
+			}
+		}
+	}
+	return o->cbuf;
+}
+
 static const uint8_t *to_container(output_t *o, const uint8_t *src, int64_t frames)
 {
+	if (o->is_dsd)
+		return to_container_dsd(o, src, frames);
 	if (container_is_wire(o))
 		return src;
 	int64_t ns = frames * o->channels;
@@ -395,15 +499,17 @@ static void *output_thread(void *arg)
 		int64_t n = o->period;
 		size_t fb = (size_t)o->wire_bpf;
 		if (!st) {
-			memset(o->pbuf, 0, (size_t)n * fb);
+			memset(o->pbuf, o->silence_byte, (size_t)n * fb);
 		} else {
 			int64_t sil = start_idx > written ? start_idx - written : 0;
 			if (sil > n)
 				sil = n;
 			if (sil)
-				memset(o->pbuf, 0, (size_t)sil * fb);
-			if (n - sil)
-				stream_read(st, o->pbuf + (size_t)sil * fb, n - sil);
+				memset(o->pbuf, o->silence_byte, (size_t)sil * fb);
+			if (n - sil) {
+				int64_t scale = o->is_dsd ? o->dsd_bpf_bits : 1;
+				stream_read(st, o->pbuf + (size_t)sil * fb, (n - sil) * scale);
+			}
 			stream_unref(st);
 		}
 		int rc;
@@ -430,13 +536,80 @@ static void *output_thread(void *arg)
 	return NULL;
 }
 
+void output_pw_process(output_t *o, uint8_t *dst, int64_t nframes, int64_t queued_frames)
+{
+	pthread_mutex_lock(&o->mu);
+	if (o->quit) {
+		pthread_mutex_unlock(&o->mu);
+		memset(dst, 0, (size_t)nframes * (size_t)o->wire_bpf);
+		return;
+	}
+	if (o->start_pending) {
+		int64_t k = (int64_t)ceil((double)(o->start_time - o->L0) / o->nspf);
+		int64_t s0 = o->start_sample;
+		if (k < o->written) {
+			LOGW("[output] start time is %lld frames late; starting late instead of "
+			     "dropping them", (long long)(o->written - k));
+			k = o->written;
+		}
+		LOGI("[output] stream begins at device frame %lld (written so far %lld), first sample %lld",
+		     (long long)k, (long long)o->written, (long long)s0);
+		stream_begin_read(o->st, s0);
+		o->start_idx = k;
+		o->playing = true;
+		o->start_pending = false;
+	}
+	stream_t *st = o->playing ? o->st : NULL;
+	if (st)
+		stream_ref(st);
+	int64_t start_idx = o->start_idx, written = o->written;
+	pthread_mutex_unlock(&o->mu);
+
+	size_t fb = (size_t)o->wire_bpf;
+	if (!st) {
+		memset(dst, 0, (size_t)nframes * fb);
+	} else {
+		int64_t sil = start_idx > written ? start_idx - written : 0;
+		if (sil > nframes)
+			sil = nframes;
+		if (sil)
+			memset(dst, 0, (size_t)sil * fb);
+		if (nframes - sil)
+			stream_read(st, dst + (size_t)sil * fb, nframes - sil);
+		stream_unref(st);
+	}
+
+	pthread_mutex_lock(&o->mu);
+	o->written += nframes;
+	int64_t pos = o->written - queued_frames;
+	if (pos < 0)
+		pos = 0;
+	clock_update(o, pos);
+	pthread_mutex_unlock(&o->mu);
+}
+
+void output_pw_lost(output_t *o)
+{
+	pthread_mutex_lock(&o->mu);
+	if (!o->lost) {
+		o->lost = true;
+		uint64_t one = 1;
+		if (write(o->evfd, &one, sizeof one) < 0)
+			LOGE("[output] eventfd: %s", strerror(errno));
+	}
+	pthread_mutex_unlock(&o->mu);
+}
+
 /* ---- API ---- */
 
-output_t *output_open(const pdev_t *pd, int rate, int bits, int channels, int64_t clock_base,
-		      const char **status)
+output_t *output_open(const pdev_t *pd, const char *sample_type, int rate, int bits, int channels,
+		      int dsd_mode, int64_t clock_base, const char **status)
 {
-	if (!pdev_supports(pd, rate, bits, channels)) {
-		LOGW("[output] %s: %d/%d/%d is not in the device's format list", pd->id, rate, bits, channels);
+	bool is_dsd = sample_type && !strcmp(sample_type, "dsd");
+	if (!pdev_supports(pd, rate, bits, channels) || (is_dsd && bits != 1) ||
+	    (!is_dsd && bits == 1)) {
+		LOGW("[output] %s: %s %d/%d/%d is not in the device's format list", pd->id,
+		     sample_type ? sample_type : "?", rate, bits, channels);
 		*status = "RAAT__OUTPUT_PLUGIN_STATUS_FORMAT_NOT_SUPPORTED";
 		return NULL;
 	}
@@ -449,24 +622,17 @@ output_t *output_open(const pdev_t *pd, int rate, int bits, int channels, int64_
 	}
 	output_t *o = xcalloc(1, sizeof *o);
 	pdev_copy(&o->pd, pd);
+	o->is_dsd = is_dsd;
+	o->dsd_mode = is_dsd ? dsd_mode : DSD_MODE_NONE;
+	o->silence_byte = is_dsd ? 0x69 : 0x00;
 	o->rate = rate;
 	o->bits = bits;
 	o->channels = channels;
-	o->wire_bpf = bits / 8 * channels;
+	o->wire_bpf = is_dsd ? 4 * channels : (bits / 8) * channels;
 	o->nspf = 1e9 / rate;
 	o->tfd = -1;
 	o->sink_fd = -1;
 	o->evfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-	if (pd->backend == BACKEND_ALSA) {
-		*status = alsa_open(o);
-		if (*status)
-			goto fail;
-	} else if (null_open(o) < 0) {
-		*status = "RAAT__OUTPUT_PLUGIN_STATUS_DEVICE_INIT_FAILED";
-		goto fail;
-	}
-	o->pbuf = xmalloc((size_t)o->period * (size_t)o->wire_bpf);
-	o->cbuf = xmalloc((size_t)o->period * (size_t)o->channels * 4);
 	pthread_mutex_init(&o->mu, NULL);
 	pthread_cond_init(&o->cv, NULL);
 	/* The clock starts at 0 with the first setup and resumes from where it
@@ -474,19 +640,38 @@ output_t *output_open(const pdev_t *pd, int rate, int bits, int channels, int64_
 	 * setup and, after a 1 s teardown gap, a value that had paused (spec 13.7). */
 	o->L0 = clock_base;
 	o->off = (double)clock_base - (double)now_ns();
-	pthread_attr_t attr;
-	pthread_attr_init(&attr);
-	pthread_attr_setstacksize(&attr, 128 * 1024);
-	if (pthread_create(&o->th, &attr, output_thread, o) != 0) {
-		pthread_attr_destroy(&attr);
+	if (pd->backend == BACKEND_ALSA) {
+		*status = alsa_open(o);
+		if (*status)
+			goto fail;
+	} else if (pd->backend == BACKEND_PIPEWIRE) {
+		o->pw = pw_output_open(o, pd, rate, bits, channels, g_alsa_buffer_ms,
+				       &o->period, &o->bufsize, status);
+		if (!o->pw)
+			goto fail;
+	} else if (null_open(o) < 0) {
 		*status = "RAAT__OUTPUT_PLUGIN_STATUS_DEVICE_INIT_FAILED";
 		goto fail;
 	}
-	pthread_attr_destroy(&attr);
+	if (!o->pw) {
+		o->pbuf = xmalloc((size_t)o->period * (size_t)o->wire_bpf);
+		o->cbuf = xmalloc((size_t)o->period * (size_t)o->channels * 4);
+		pthread_attr_t attr;
+		pthread_attr_init(&attr);
+		pthread_attr_setstacksize(&attr, 128 * 1024);
+		if (pthread_create(&o->th, &attr, output_thread, o) != 0) {
+			pthread_attr_destroy(&attr);
+			*status = "RAAT__OUTPUT_PLUGIN_STATUS_DEVICE_INIT_FAILED";
+			goto fail;
+		}
+		pthread_attr_destroy(&attr);
+	}
 	open_outputs[slot] = o;
 	*status = NULL;
 	return o;
 fail:
+	if (o->pw)
+		pw_output_close(o->pw);
 	if (o->pcm)
 		snd_pcm_close(o->pcm);
 	if (o->tfd >= 0)
@@ -494,6 +679,8 @@ fail:
 	if (o->sink_fd >= 0)
 		close(o->sink_fd);
 	close(o->evfd);
+	pthread_mutex_destroy(&o->mu);
+	pthread_cond_destroy(&o->cv);
 	free(o->pbuf);
 	free(o->cbuf);
 	pdev_clear(&o->pd);
@@ -510,8 +697,13 @@ int64_t output_close(output_t *o)
 	o->quit = true;
 	pthread_cond_broadcast(&o->cv);
 	pthread_mutex_unlock(&o->mu);
-	/* The thread finishes its current period write (at most one period). */
-	pthread_join(o->th, NULL);
+	if (o->pw) {
+		pw_output_close(o->pw);
+		o->pw = NULL;
+	} else {
+		/* The thread finishes its current period write (at most one period). */
+		pthread_join(o->th, NULL);
+	}
 	for (int i = 0; i < MAX_OPEN; i++)
 		if (open_outputs[i] == o)
 			open_outputs[i] = NULL;
@@ -540,7 +732,7 @@ int64_t output_close(output_t *o)
 int output_start(output_t *o, int64_t time_ns, int64_t stream_sample, stream_t *st, const char **err)
 {
 	if (st->rate != o->rate || st->bits != o->bits || st->channels != o->channels ||
-	    strcmp(st->sample_type, "pcm")) {
+	    strcmp(st->sample_type, o->is_dsd ? "dsd" : "pcm")) {
 		*err = "RAAT__OUTPUT_PLUGIN_STATUS_FORMAT_NOT_SUPPORTED";
 		return -1;
 	}
@@ -646,11 +838,19 @@ char *output_signal_path_json(output_t *o)
 {
 	cJSON *root = cJSON_CreateObject();
 	cJSON *arr = cJSON_AddArrayToObject(root, "signal_path");
+	if (o->is_dsd && o->dsd_mode == DSD_MODE_DOP) {
+		cJSON *de = cJSON_CreateObject();
+		cJSON_AddStringToObject(de, "type", "dsd_encapsulate");
+		cJSON_AddStringToObject(de, "method", "dop");
+		cJSON_AddStringToObject(de, "quality", "lossless");
+		cJSON_AddItemToArray(arr, de);
+	}
 	cJSON *e = cJSON_CreateObject();
 	/* Shape as sent by the R26 (capture3): alsa_device is the card info. */
 	cJSON_AddStringToObject(e, "type", "output");
-	cJSON_AddStringToObject(e, "method", o->pcm ? "alsa" : "null");
-	cJSON_AddStringToObject(e, "quality", "lossless");
+	cJSON_AddStringToObject(e, "method",
+				o->pw ? "os_mixer" : (o->pcm ? "alsa" : "null"));
+	cJSON_AddStringToObject(e, "quality", o->pw ? "high" : "lossless");
 	cJSON *ad = cJSON_AddObjectToObject(e, "alsa_device");
 	cJSON_AddStringToObject(ad, "name", o->pd.name);
 	cJSON_AddStringToObject(ad, "id", o->pd.card_id);

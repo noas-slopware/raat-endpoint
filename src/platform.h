@@ -13,10 +13,11 @@ typedef struct {
 	int rate, bits, channels;
 } pcm_fmt_t;
 
-enum { BACKEND_ALSA, BACKEND_NULL };
+enum { BACKEND_ALSA, BACKEND_NULL, BACKEND_PIPEWIRE };
+enum { DSD_MODE_NONE = 0, DSD_MODE_NATIVE = 1, DSD_MODE_DOP = 2 };
 
 typedef struct pdev {
-	char id[96];          /* "hw:CARD=<id>,DEV=<n>" */
+	char id[144];         /* "hw:CARD=<id>,DEV=<n>" or "pw:<node.name>" */
 	char name[128];       /* card name (USB product string for USB audio) */
 	char vendor[128];     /* USB manufacturer, "" if unknown */
 	char usb_id[16];      /* "vvvv:pppp", "" if not USB */
@@ -28,6 +29,8 @@ typedef struct pdev {
 	char container[16];   /* fixture only: ALSA container the null backend mimics */
 	int card, dev;
 	int backend;
+	bool has_native_dsd;  /* ALSA supports native DSD_U* */
+	bool has_dop;         /* ALSA supports 24/32-bit PCM at >= 176.4 kHz for DoP */
 	pcm_fmt_t *fmts;
 	int nfmts;
 } pdev_t;
@@ -36,8 +39,9 @@ struct platform_uname {
 	char sysname[65], nodename[65], release[65], version[129], machine[65];
 };
 
-/* fixture_path NULL = ALSA. */
-int platform_init(const char *fixture_path);
+/* fixture_path NULL = ALSA (unless use_pipewire is true). */
+int platform_init(const char *fixture_path, bool use_pipewire);
+void platform_shutdown(void);
 /* Fresh scan; caller frees with platform_free_list(). Devices we hold open
  * (platform_device_busy) keep their formats from `prev` instead of re-probing. */
 int platform_scan(pdev_t **out, int *n, const pdev_t *prev, int nprev);

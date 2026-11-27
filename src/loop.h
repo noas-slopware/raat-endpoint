@@ -34,6 +34,7 @@ void loop_run(void);
 void loop_stop(void);
 /* Run queued deferred tasks (used once more after loop_run returns). */
 void loop_run_pending(void);
+void loop_shutdown(void);
 
 int loop_io_add(io_watch_t *w, int fd, uint32_t events, io_cb cb, void *ud);
 int loop_io_mod(io_watch_t *w, uint32_t events);

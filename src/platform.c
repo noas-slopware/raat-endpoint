@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "platform.h"
+#include "pw_backend.h"
 
 #include <alsa/asoundlib.h>
 #include <errno.h>
@@ -13,6 +14,7 @@
 #include "third_party/cjson/cJSON.h"
 
 static char *fixture;
+static bool use_pw;
 static struct platform_uname uname_info;
 static snd_config_t *lconf;
 
@@ -60,8 +62,9 @@ static void copy_json_str(char *dst, size_t n, const cJSON *obj, const char *key
 	strlcpy0(dst, cJSON_IsString(v) ? v->valuestring : "", n);
 }
 
-int platform_init(const char *fixture_path)
+int platform_init(const char *fixture_path, bool use_pipewire)
 {
+	use_pw = false;
 	struct utsname u;
 	uname(&u);
 	strlcpy0(uname_info.sysname, u.sysname, sizeof uname_info.sysname);
@@ -76,6 +79,8 @@ int platform_init(const char *fixture_path)
 		free(txt);
 		if (!j) {
 			LOGE("fixture %s: unreadable or invalid JSON", fixture);
+			free(fixture);
+			fixture = NULL;
 			return -1;
 		}
 		const cJSON *un = cJSON_GetObjectItemCaseSensitive(j, "uname");
@@ -87,8 +92,26 @@ int platform_init(const char *fixture_path)
 			copy_json_str(uname_info.machine, sizeof uname_info.machine, un, "machine");
 		}
 		cJSON_Delete(j);
+	} else if (use_pipewire) {
+		if (pw_platform_init() < 0)
+			return -1;
+		use_pw = true;
 	}
 	return 0;
+}
+
+void platform_shutdown(void)
+{
+	if (use_pw) {
+		pw_platform_shutdown();
+		use_pw = false;
+	}
+	free(fixture);
+	fixture = NULL;
+	if (lconf) {
+		snd_config_delete(lconf);
+		lconf = NULL;
+	}
 }
 
 const struct platform_uname *platform_uname(void)
@@ -226,6 +249,19 @@ static int scan_fixture(pdev_t **out, int *n)
 static const unsigned std_rates[] = { 44100, 48000, 88200, 96000, 176400, 192000,
 				      352800, 384000, 705600, 768000 };
 
+static const unsigned dsd_rates[] = { 2822400, 5644800, 11289600, 22579200, 45158400 };
+
+static const struct {
+	snd_pcm_format_t f;
+	unsigned bits_per_frame;
+} dsd_containers[] = {
+	{ SND_PCM_FORMAT_DSD_U32_BE, 32 },
+	{ SND_PCM_FORMAT_DSD_U32_LE, 32 },
+	{ SND_PCM_FORMAT_DSD_U16_BE, 16 },
+	{ SND_PCM_FORMAT_DSD_U16_LE, 16 },
+	{ SND_PCM_FORMAT_DSD_U8, 8 },
+};
+
 /* Container formats per wire bit depth. Wire PCM is packed little-endian
  * (spec 13.6); 16- and 24-bit may also go into a 32-bit container, which is
  * lossless. The R26 offered 16/24/32 bits on the G20, whose only container is
@@ -276,6 +312,37 @@ static void probe_formats(pdev_t *d)
 					     containers[ci].bits, ch, snd_pcm_format_name(containers[ci].f));
 					add_fmt(d, (int)std_rates[ri], containers[ci].bits, (int)ch);
 				}
+			}
+		}
+	}
+	/* Probe native DSD (DSD_U32_BE/LE, DSD_U16_BE/LE, DSD_U8). */
+	for (size_t ci = 0; ci < sizeof dsd_containers / sizeof dsd_containers[0]; ci++) {
+		for (unsigned ch = chmin ? chmin : 1; ch <= chmax; ch++) {
+			for (size_t ri = 0; ri < sizeof dsd_rates / sizeof dsd_rates[0]; ri++) {
+				unsigned alsa_rate = dsd_rates[ri] / dsd_containers[ci].bits_per_frame;
+				snd_pcm_hw_params_copy(hw, any);
+				if (snd_pcm_hw_params_set_format(pcm, hw, dsd_containers[ci].f) < 0)
+					break;
+				if (snd_pcm_hw_params_set_channels(pcm, hw, ch) < 0)
+					break;
+				if (snd_pcm_hw_params_test_rate(pcm, hw, alsa_rate, 0) == 0) {
+					LOGD("[alsa] %s takes DSD %u/1/%u as %s (alsa %u Hz)", d->id,
+					     dsd_rates[ri], ch, snd_pcm_format_name(dsd_containers[ci].f),
+					     alsa_rate);
+					d->has_native_dsd = true;
+					add_fmt(d, (int)dsd_rates[ri], 1, (int)ch);
+				}
+			}
+		}
+	}
+	/* Probe DoP (16 DSD bits per 24/32-bit PCM frame at rate/16). */
+	for (size_t ri = 0; ri < sizeof dsd_rates / sizeof dsd_rates[0]; ri++) {
+		int dop_pcm_rate = (int)(dsd_rates[ri] / 16);
+		for (unsigned ch = chmin ? chmin : 1; ch <= chmax; ch++) {
+			if (pdev_supports(d, dop_pcm_rate, 24, (int)ch) ||
+			    pdev_supports(d, dop_pcm_rate, 32, (int)ch)) {
+				d->has_dop = true;
+				add_fmt(d, (int)dsd_rates[ri], 1, (int)ch);
 			}
 		}
 	}
@@ -372,6 +439,8 @@ int platform_scan(pdev_t **out, int *n, const pdev_t *prev, int nprev)
 	*n = 0;
 	if (fixture)
 		return scan_fixture(out, n);
+	if (use_pw)
+		return pw_platform_scan(out, n);
 	return scan_alsa(out, n, prev, nprev);
 }
 
@@ -379,6 +448,8 @@ int platform_watch_fd(void)
 {
 	if (fixture)
 		return -1;
+	if (use_pw)
+		return pw_platform_watch_fd();
 	int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
 	if (fd < 0)
 		return -1;
@@ -391,6 +462,10 @@ int platform_watch_fd(void)
 
 void platform_watch_drain(int fd)
 {
+	if (use_pw) {
+		pw_platform_watch_drain(fd);
+		return;
+	}
 	char buf[4096];
 	while (read(fd, buf, sizeof buf) > 0)
 		;

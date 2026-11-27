@@ -13,6 +13,9 @@ enum { LOG_TRACE, LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR, LOG_CRIT };
 
 extern int g_log_level;
 
+typedef void (*log_cb_t)(int level, const char *msg, void *ud);
+void log_set_cb(log_cb_t cb, void *ud);
+
 void log_msg(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void log_vmsg(int level, const char *fmt, va_list ap);
 

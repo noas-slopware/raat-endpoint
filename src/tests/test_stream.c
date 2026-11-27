@@ -170,6 +170,36 @@ static void test_retention_bounded(void)
 	stream_unref(s);
 }
 
+static void test_dsd(void)
+{
+	const char *err = NULL;
+	stream_t *s = stream_new("dsd", 2822400, 1, 2, 2822400, &err);
+	CHECK(s != NULL && err == NULL, "stream_new dsd64 succeeds");
+	CHECK(s->sample_div == 8 && s->silence_byte == 0x69, "dsd sample_div=8, silence=0x69");
+
+	/* Non-multiple of 8 samples must be rejected. */
+	uint8_t dummy[8] = { 0 };
+	CHECK(stream_write(s, 0, 0, 0, dummy, sizeof dummy, 7, -1, false, &err) < 0,
+	      "dsd rejects nsamples not multiple of 8");
+
+	/* CHMAP 0 inserts 0x69 silence; followed by 32 DSD bits (4 byte-frames = 8 bytes). */
+	CHECK(stream_write(s, 0, 0, 0, dummy, 0, 16, 0, true, &err) == 0, "dsd chmap 0 silence");
+	uint8_t in[8] = { 0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44 };
+	CHECK(stream_write(s, 16, 0, 0, in, sizeof in, 32, -1, true, &err) == 0, "dsd write 32 bits");
+
+	uint8_t out[16];
+	memset(out, 0, sizeof out);
+	stream_begin_read(s, 0);
+	stream_read(s, out, 64); /* 16 silence + 32 data + 16 dropout silence */
+	CHECK(out[0] == 0x69 && out[1] == 0x69 && out[2] == 0x69 && out[3] == 0x69,
+	      "dsd chmap 0 produces 0x69 silence");
+	CHECK(memcmp(out + 4, in, 8) == 0, "dsd data read back bit-exact");
+	CHECK(out[12] == 0x69 && out[13] == 0x69 && out[14] == 0x69 && out[15] == 0x69,
+	      "dsd dropout padded with 0x69");
+	CHECK(s->dropout_count == 1, "dsd dropout counted");
+	stream_unref(s);
+}
+
 int main(void)
 {
 	test_chmap0_silence();
@@ -181,6 +211,7 @@ int main(void)
 	test_full_unchanged();
 	test_resume_rewind();
 	test_retention_bounded();
+	test_dsd();
 	printf("stream unit tests: %d passed, %d failed\n", passes, fails);
 	return fails ? 1 : 0;
 }

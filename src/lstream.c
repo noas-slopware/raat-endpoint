@@ -101,15 +101,21 @@ static int s_get_stats(lua_State *L)
 	int64_t fill = s->empty ? 0 : s->hi - (s->has_read ? (s->rd > s->lo ? s->rd : s->lo) : s->lo);
 	if (fill < 0)
 		fill = 0;
+	int64_t div = s->sample_div;
 	struct {
 		const char *k;
 		int64_t v;
 	} f[] = {
-		{ "write_count", s->write_count },     { "read_count", s->read_count },
-		{ "samples_in", s->samples_in },       { "samples_out", s->samples_out },
-		{ "dropout_count", s->dropout_count }, { "samples_dropped", s->samples_dropped },
-		{ "overrun_count", s->overrun_count }, { "samples_overrun", s->samples_overrun },
-		{ "capacity_samples", s->capacity },   { "fill_samples", fill },
+		{ "write_count", s->write_count },
+		{ "read_count", s->read_count },
+		{ "samples_in", s->samples_in * div },
+		{ "samples_out", s->samples_out * div },
+		{ "dropout_count", s->dropout_count },
+		{ "samples_dropped", s->samples_dropped * div },
+		{ "overrun_count", s->overrun_count },
+		{ "samples_overrun", s->samples_overrun * div },
+		{ "capacity_samples", s->capacity * div },
+		{ "fill_samples", fill * div },
 	};
 	pthread_mutex_unlock(&s->mu);
 	for (size_t i = 0; i < sizeof f / sizeof f[0]; i++) {

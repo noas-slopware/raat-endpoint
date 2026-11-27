@@ -88,9 +88,10 @@ static size_t put_kv(uint8_t *p, size_t off, size_t cap, const char *k, const ch
 	return off + vl;
 }
 
-static void handle_packet(const uint8_t *p, size_t n, const struct sockaddr_in *src)
+static void handle_packet(const uint8_t *p, size_t n, const struct sockaddr_in *src,
+			  bool override_replyaddr)
 {
-	if (n < 6 || memcmp(p, "SOOD", 4) || p[4] != 2 || p[5] != 'Q')
+	if (S.w.fd < 0 || n < 6 || memcmp(p, "SOOD", 4) || p[4] != 2 || p[5] != 'Q')
 		return;
 	char service[64] = "", tid[64] = "", raddr[64] = "", rport[16] = "";
 	bool have_tid = false;
@@ -131,7 +132,7 @@ static void handle_packet(const uint8_t *p, size_t n, const struct sockaddr_in *
 		return;
 
 	struct sockaddr_in to = *src;
-	if (raddr[0] && inet_pton(AF_INET, raddr, &to.sin_addr) != 1)
+	if (!override_replyaddr && raddr[0] && inet_pton(AF_INET, raddr, &to.sin_addr) != 1)
 		return;
 	if (rport[0]) {
 		long pv = strtol(rport, NULL, 10);
@@ -251,8 +252,39 @@ static void sood_io(io_watch_t *w, uint32_t ev)
 		ssize_t n = recvfrom(w->fd, buf, sizeof buf, 0, (struct sockaddr *)&src, &sl);
 		if (n < 0)
 			return;
-		handle_packet(buf, (size_t)n, &src);
+		handle_packet(buf, (size_t)n, &src, false);
 	}
+}
+
+void sood_inject_query(const uint8_t *pkt, size_t len, const struct sockaddr_in *core_addr,
+		       bool override_replyaddr)
+{
+	if (!pkt || !core_addr)
+		return;
+	handle_packet(pkt, len, core_addr, override_replyaddr);
+}
+
+void sood_announce_unicast(const struct sockaddr_in *core_addr)
+{
+	if (S.w.fd < 0 || !core_addr)
+		return;
+	uint8_t out[1400];
+	char tid[37];
+	guid_new(tid);
+	seen_tid(tid);
+	memcpy(out, "SOOD\x02Q", 6);
+	size_t o = put_kv(out, 6, sizeof out, "_tid", tid);
+	for (int i = 0; i < S.nkv; i++)
+		o = put_kv(out, o, sizeof out, S.keys[i], S.vals[i]);
+	struct sockaddr_in to = *core_addr;
+	if (to.sin_port == 0)
+		to.sin_port = htons(SOOD_DEFAULT_PORT);
+	char ip[INET_ADDRSTRLEN];
+	inet_ntop(AF_INET, &to.sin_addr, ip, sizeof ip);
+	if (sendto(S.w.fd, out, o, 0, (struct sockaddr *)&to, sizeof to) < 0)
+		LOGW("[sood] unicast announce to %s:%d: %s", ip, ntohs(to.sin_port), strerror(errno));
+	else
+		LOGI("[sood] unicast announced to %s:%d", ip, ntohs(to.sin_port));
 }
 
 static void netlink_io(io_watch_t *w, uint32_t ev)
@@ -321,4 +353,11 @@ void sood_stop(void)
 		close(fd);
 	if (nl >= 0)
 		close(nl);
+	for (int i = 0; i < S.nkv; i++) {
+		free(S.keys[i]);
+		free(S.vals[i]);
+	}
+	memset(&S, 0, sizeof S);
+	S.w.fd = -1;
+	S.nlw.fd = -1;
 }

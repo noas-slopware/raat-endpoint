@@ -16,13 +16,22 @@ size_t g_stream_max_bytes = 32u << 20;
 stream_t *stream_new(const char *sample_type, int rate, int bits, int channels, int64_t capacity,
 		     const char **err)
 {
-	int bps;
+	int bps, sample_div = 1;
+	uint8_t silence_byte = 0x00;
 	if (!strcmp(sample_type, "pcm")) {
 		if (bits != 16 && bits != 24 && bits != 32) {
 			*err = "unsupported bits_per_sample";
 			return NULL;
 		}
 		bps = bits / 8;
+	} else if (!strcmp(sample_type, "dsd")) {
+		if (bits != 1) {
+			*err = "unsupported bits_per_sample";
+			return NULL;
+		}
+		bps = 1;
+		sample_div = 8;
+		silence_byte = 0x69;
 	} else if (!strcmp(sample_type, "pcm_float32")) {
 		bps = 4;
 	} else if (!strcmp(sample_type, "pcm_float64")) {
@@ -36,16 +45,19 @@ stream_t *stream_new(const char *sample_type, int rate, int bits, int channels, 
 		return NULL;
 	}
 	int bpf = bps * channels;
-	int64_t want = capacity;
-	if ((uint64_t)capacity * (uint64_t)bpf > g_stream_max_bytes) {
+	int64_t slots = (capacity + sample_div - 1) / sample_div;
+	if (slots <= 0)
+		slots = 1;
+	int64_t want = slots;
+	if ((uint64_t)slots * (uint64_t)bpf > g_stream_max_bytes) {
 		int64_t capped = (int64_t)(g_stream_max_bytes / (size_t)bpf);
-		if (capped < capacity * 3 / 10)
-			capped = capacity * 3 / 10;
-		capacity = capped;
-		LOGW("[stream] capacity %lld frames (%lld bytes) above budget; using %lld frames",
-		     (long long)want, (long long)want * bpf, (long long)capacity);
+		if (capped < slots * 3 / 10)
+			capped = slots * 3 / 10;
+		slots = capped;
+		LOGW("[stream] capacity %lld slots (%lld bytes) above budget; using %lld slots",
+		     (long long)want, (long long)want * bpf, (long long)slots);
 	}
-	uint8_t *data = malloc((size_t)capacity * (size_t)bpf);
+	uint8_t *data = malloc((size_t)slots * (size_t)bpf);
 	if (!data) {
 		*err = "out of memory";
 		return NULL;
@@ -58,11 +70,13 @@ stream_t *stream_new(const char *sample_type, int rate, int bits, int channels, 
 	s->bits = bits;
 	s->channels = channels;
 	s->bpf = bpf;
-	s->capacity = capacity;
+	s->sample_div = sample_div;
+	s->silence_byte = silence_byte;
+	s->capacity = slots;
 	s->data = data;
 	s->empty = true;
-	LOGD("[stream] new %s %d/%d/%d capacity=%lld frames", sample_type, rate, bits, channels,
-	     (long long)capacity);
+	LOGD("[stream] new %s %d/%d/%d capacity=%lld samples (%lld slots)", sample_type, rate, bits,
+	     channels, (long long)(slots * sample_div), (long long)slots);
 	return s;
 }
 
@@ -103,9 +117,9 @@ static void ring_zero(stream_t *s, int64_t sample, int64_t n)
 {
 	int64_t slot = sample % s->capacity;
 	int64_t first = s->capacity - slot < n ? s->capacity - slot : n;
-	memset(s->data + slot * s->bpf, 0, (size_t)(first * s->bpf));
+	memset(s->data + slot * s->bpf, s->silence_byte, (size_t)(first * s->bpf));
 	if (n > first)
-		memset(s->data, 0, (size_t)((n - first) * s->bpf));
+		memset(s->data, s->silence_byte, (size_t)((n - first) * s->bpf));
 }
 
 static int write_frames(stream_t *s, int64_t sample, double gain, double peak, const uint8_t *data,
@@ -192,6 +206,7 @@ void stream_clear(stream_t *s)
 
 void stream_begin_read(stream_t *s, int64_t sample)
 {
+	sample /= s->sample_div;
 	pthread_mutex_lock(&s->mu);
 	s->reading = true;
 	s->has_read = true;
@@ -210,6 +225,7 @@ void stream_end_read(stream_t *s)
 
 void stream_read(stream_t *s, uint8_t *dst, int64_t n)
 {
+	n /= s->sample_div;
 	pthread_mutex_lock(&s->mu);
 	s->read_count++;
 	int64_t got = 0;
@@ -218,7 +234,7 @@ void stream_read(stream_t *s, uint8_t *dst, int64_t n)
 		ring_get(s, s->rd, dst, got);
 	}
 	if (got < n) {
-		memset(dst + got * s->bpf, 0, (size_t)((n - got) * s->bpf));
+		memset(dst + got * s->bpf, s->silence_byte, (size_t)((n - got) * s->bpf));
 		s->dropout_count++;
 		s->samples_dropped += n - got;
 	}
@@ -226,7 +242,8 @@ void stream_read(stream_t *s, uint8_t *dst, int64_t n)
 	s->rd += n; /* the frames stay retained; see stream_write */
 	pthread_mutex_unlock(&s->mu);
 	if (got < n)
-		LOGT("[stream] short by %lld samples, padded with silence", (long long)(n - got));
+		LOGT("[stream] short by %lld samples, padded with silence",
+		     (long long)((n - got) * s->sample_div));
 }
 
 /*
@@ -235,12 +252,21 @@ void stream_read(stream_t *s, uint8_t *dst, int64_t n)
  * channels whose bit is set, packed in channel order, and the others are
  * silence. The Core uses chmap 0 with an empty payload to insert nsamples
  * frames of silence (seen at the start of a stream that follows another one
- * of the same format). Same as RoonBridge: expand to full frames, PCM silence
- * is 0.
+ * of the same format). Same as RoonBridge: expand to full frames, silence is
+ * 0x00 for PCM and 0x69 for DSD.
  */
 int stream_write(stream_t *s, int64_t sample, double gain, double peak, const uint8_t *data,
 		 size_t len, int64_t n, int32_t chmap, bool has_chmap, const char **err)
 {
+	if (s->sample_div > 1) {
+		if (sample < 0 || n < 0 || (sample % s->sample_div) != 0 ||
+		    (n % s->sample_div) != 0) {
+			*err = "DSD sample/nsamples must be a multiple of 8";
+			return -1;
+		}
+		sample /= s->sample_div;
+		n /= s->sample_div;
+	}
 	if (!has_chmap || chmap == -1)
 		return write_frames(s, sample, gain, peak, data, len, n, chmap, has_chmap, err);
 	if (n < 0 || n > s->capacity) {
@@ -254,11 +280,13 @@ int stream_write(stream_t *s, int64_t sample, double gain, double peak, const ui
 		*err = "data is shorter than the channel map needs";
 		return -1;
 	}
-	uint8_t *full = calloc((size_t)n ? (size_t)n : 1, (size_t)s->bpf);
+	size_t full_sz = (size_t)(n ? n : 1) * (size_t)s->bpf;
+	uint8_t *full = malloc(full_sz);
 	if (!full) {
 		*err = "out of memory";
 		return -1;
 	}
+	memset(full, s->silence_byte, full_sz);
 	const uint8_t *in = data;
 	for (int64_t f = 0; f < n; f++)
 		for (int c = 0; c < s->channels; c++)

@@ -31,8 +31,18 @@ static int64_t log_next_seq = 1;
 static int64_t log_first_seq = 1;
 
 static pthread_mutex_t log_mu = PTHREAD_MUTEX_INITIALIZER;
+static log_cb_t log_cb;
+static void *log_cb_ud;
 
 static const char *const level_names[] = { "trace", "debug", "info", "warning", "error", "critical" };
+
+void log_set_cb(log_cb_t cb, void *ud)
+{
+	pthread_mutex_lock(&log_mu);
+	log_cb = cb;
+	log_cb_ud = ud;
+	pthread_mutex_unlock(&log_mu);
+}
 
 void log_vmsg(int level, const char *fmt, va_list ap)
 {
@@ -42,6 +52,8 @@ void log_vmsg(int level, const char *fmt, va_list ap)
 		level = 0;
 	if (level > LOG_CRIT)
 		level = LOG_CRIT;
+	log_cb_t cb = NULL;
+	void *ud = NULL;
 	pthread_mutex_lock(&log_mu);
 	if (level >= LOG_DEBUG) {
 		int slot = (int)(log_next_seq % LOG_RING);
@@ -55,9 +67,15 @@ void log_vmsg(int level, const char *fmt, va_list ap)
 		if (log_next_seq - log_first_seq > LOG_RING)
 			log_first_seq = log_next_seq - LOG_RING;
 	}
-	if (level >= g_log_level)
-		fprintf(stderr, "[%s] %s\n", level_names[level], buf);
+	if (level >= g_log_level) {
+		cb = log_cb;
+		ud = log_cb_ud;
+		if (!cb)
+			fprintf(stderr, "[%s] %s\n", level_names[level], buf);
+	}
 	pthread_mutex_unlock(&log_mu);
+	if (cb)
+		cb(level, buf, ud);
 }
 
 void log_msg(int level, const char *fmt, ...)

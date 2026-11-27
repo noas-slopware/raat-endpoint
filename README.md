@@ -14,8 +14,9 @@ scripts are in this repository; `RAAT-PROTOCOL.md` describes behaviour and cites
 | `RAAT-PROTOCOL.md` | the protocol as far as it is known: discovery, the manager JSON-RPC, script loading, the session and audio paths, open questions |
 | `tools/r26cap.c` | tiny static pcap capture (AF_PACKET) for boxes without tcpdump: TCP to and from one peer, both directions |
 | `tools/ll_decode.py` | reassembles the TCP streams of a capture and decodes the RAAT frames to JSON lines |
-| `src/` | the endpoint in C: SOOD responder, manager JSON-RPC, per-device LL server, Lua 5.3 host for the Core's scripts with the `raat`/`buffer`/`stream`/`uv` surface, ALSA output thread. `make`, `make armhf`, `make test` |
-| `packaging/` | systemd unit, OpenRC init script and its conf.d |
+| `tools/raatflector.c` | standalone LAN-to-VPN SOOD reflector server (`make raatflector`) for L3 VPNs like Tailscale |
+| `src/` | the endpoint in C: SOOD responder, manager JSON-RPC, per-device LL server, Lua 5.3 host for the Core's scripts with the `raat`/`buffer`/`stream`/`uv` surface, ALSA (default bit-perfect) and optional PipeWire backends, optional RAATflector client, and `libraat-endpoint.so`. `make`, `make RAATFLECTOR=1`, `make PIPEWIRE=0`, `make armhf`, `make test` |
+| `packaging/` | systemd units (system, PipeWire user mode, raatflector server), OpenRC init script and its conf.d |
 
 Status: running on the Gustard R26 against a real Core since 2026-11-24, in place of RoonBridge,
 first on Debian 12 (systemd) and now on Alpine (OpenRC). Verified there: discovery, and finding the
@@ -63,6 +64,49 @@ rc-update add raat-endpoint default && rc-service raat-endpoint start
 
 The identity files are what make the Core treat it as the same zone. Keep a copy of
 `/var/lib/raat-endpoint/Settings`.
+
+## PipeWire user-process mode
+
+ALSA (`hw:`) stays the default bit-perfect backend (supporting PCM plus Native DSD and DoP when the
+DAC advertises them). On desktop Linux where PipeWire owns the audio devices, build with
+`PIPEWIRE=1` (auto-detected on host when `libpipewire-0.3` is installed; off on `armhf`) and run
+with `--pipewire`:
+
+```sh
+raat-endpoint --pipewire
+```
+
+Non-root runs default their data directory to `$XDG_DATA_HOME/raat-endpoint` (or
+`~/.local/share/raat-endpoint`). PipeWire mode exposes `"PipeWire Default Output"` (follows desktop
+sink switching) plus each individual `Audio/Sink` node. A user unit is in
+`packaging/raat-endpoint-user.service`.
+
+## RAATflector (L3 VPN / Tailscale)
+
+Roon's SOOD discovery relies on UDP multicast (`239.255.90.90:9003`), which does not cross L3 VPNs
+like Tailscale. RAATflector reflects only SOOD queries from the Core's LAN to one or more remote
+`raat-endpoint` clients; the actual manager, session, audio, and clock traffic goes directly
+peer-to-peer over the VPN.
+
+Build client support with `make RAATFLECTOR=1` (off by default). Run `raatflector` on the Core's
+LAN (or on the Core host itself), bound to your VPN address:
+
+```sh
+# Server (Core LAN / Core host)
+raatflector --bind <server-vpn-ip> --port 9004 --core-ip <core-vpn-ip> --token <secret>
+
+# Client (remote Tailscale peer)
+raat-endpoint --pipewire --raatflector <server-vpn-ip>:9004 --raatflector-token <secret>
+```
+
+Omit `--core-ip` if remote clients already have a subnet route to the Core's LAN IP.
+
+## Shared library (`libraat-endpoint.so`)
+
+Host builds produce `src/build/host/libraat-endpoint.so` with `-fvisibility=hidden`, exporting only
+the C API declared in `src/raat_endpoint.h` (vendored Lua and cJSON symbols are hidden). Use
+`raat_endpoint_config_init()`, `raat_endpoint_start()`, and `raat_endpoint_stop()` to embed an
+endpoint in another application.
 
 ## License
 

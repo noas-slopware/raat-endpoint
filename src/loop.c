@@ -2,12 +2,16 @@
 #include "loop.h"
 
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 
 static int epfd = -1;
-static bool stopping;
+static int wake_fd = -1;
+static io_watch_t wake_w = { .fd = -1 };
+static _Atomic bool stopping;
 
 static ltimer_t **heap;
 static int heap_n, heap_cap;
@@ -19,15 +23,44 @@ struct deferred {
 };
 static struct deferred *dq_head, *dq_tail;
 
+static void wake_cb(io_watch_t *w, uint32_t ev)
+{
+	(void)ev;
+	uint64_t v;
+	while (read(w->fd, &v, sizeof v) > 0)
+		;
+}
+
 int loop_init(void)
 {
+	atomic_store(&stopping, false);
 	epfd = epoll_create1(EPOLL_CLOEXEC);
-	return epfd < 0 ? -1 : 0;
+	if (epfd < 0)
+		return -1;
+	wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (wake_fd < 0) {
+		close(epfd);
+		epfd = -1;
+		return -1;
+	}
+	if (loop_io_add(&wake_w, wake_fd, EPOLLIN, wake_cb, NULL) < 0) {
+		close(wake_fd);
+		close(epfd);
+		wake_fd = epfd = -1;
+		return -1;
+	}
+	return 0;
 }
 
 void loop_stop(void)
 {
-	stopping = true;
+	atomic_store(&stopping, true);
+	int fd = wake_fd;
+	if (fd >= 0) {
+		uint64_t one = 1;
+		ssize_t r = write(fd, &one, sizeof one);
+		(void)r;
+	}
 }
 
 int loop_io_add(io_watch_t *w, int fd, uint32_t events, io_cb cb, void *ud)
@@ -182,7 +215,7 @@ static void run_deferred(void)
 void loop_run(void)
 {
 	struct epoll_event evs[64];
-	while (!stopping) {
+	while (!atomic_load(&stopping)) {
 		run_deferred();
 		int timeout = -1;
 		if (dq_head)
@@ -198,7 +231,7 @@ void loop_run(void)
 			LOGE("epoll_wait: %s", strerror(errno));
 			break;
 		}
-		for (int i = 0; i < n && !stopping; i++) {
+		for (int i = 0; i < n && !atomic_load(&stopping); i++) {
 			io_watch_t *w = evs[i].data.ptr;
 			if (w->fd >= 0)
 				w->cb(w, evs[i].events);
@@ -212,4 +245,22 @@ void loop_run(void)
 void loop_run_pending(void)
 {
 	run_deferred();
+}
+
+void loop_shutdown(void)
+{
+	run_deferred();
+	loop_io_del(&wake_w);
+	if (wake_fd >= 0) {
+		close(wake_fd);
+		wake_fd = -1;
+	}
+	if (epfd >= 0) {
+		close(epfd);
+		epfd = -1;
+	}
+	free(heap);
+	heap = NULL;
+	heap_n = heap_cap = 0;
+	atomic_store(&stopping, false);
 }

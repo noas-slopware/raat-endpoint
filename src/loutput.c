@@ -73,6 +73,26 @@ static int field_num(lua_State *L, int t, const char *k, bool *ok)
 	return (int)n;
 }
 
+static int device_dsd_mode(const mdev_t *d)
+{
+	if (!d || d->pd.backend != BACKEND_ALSA)
+		return DSD_MODE_NONE;
+	const cJSON *out = d->config ? cJSON_GetObjectItemCaseSensitive(d->config, "output") : NULL;
+	const cJSON *dm = out ? cJSON_GetObjectItemCaseSensitive(out, "dsd_mode") : NULL;
+	const char *s = cJSON_IsString(dm) ? dm->valuestring : "none";
+	if (!strcmp(s, "native"))
+		return d->pd.has_native_dsd ? DSD_MODE_NATIVE : DSD_MODE_NONE;
+	if (!strcmp(s, "dop"))
+		return d->pd.has_dop ? DSD_MODE_DOP : DSD_MODE_NONE;
+	if (!strcmp(s, "native_or_dop"))
+		return d->pd.has_native_dsd ? DSD_MODE_NATIVE
+					    : (d->pd.has_dop ? DSD_MODE_DOP : DSD_MODE_NONE);
+	if (!strcmp(s, "dop_or_native"))
+		return d->pd.has_dop ? DSD_MODE_DOP
+				     : (d->pd.has_native_dsd ? DSD_MODE_NATIVE : DSD_MODE_NONE);
+	return DSD_MODE_NONE;
+}
+
 /* setup(format, {on_setup, on_output_lost}): asynchronous, like the reference. */
 static int o_setup(lua_State *L)
 {
@@ -110,12 +130,15 @@ static int o_setup(lua_State *L)
 
 	const char *status = NULL;
 	output_t *o = NULL;
-	if (!ok || !plain || strcmp(type, "pcm")) {
-		LOGW("[output] setup refused: type %s, plain %d, fields ok %d", type, plain, ok);
-		status = "RAAT__OUTPUT_PLUGIN_STATUS_FORMAT_NOT_SUPPORTED"; /* PCM only, no DSD */
+	int dsd_mode = device_dsd_mode(d);
+	bool type_ok = !strcmp(type, "pcm") || (!strcmp(type, "dsd") && dsd_mode != DSD_MODE_NONE);
+	if (!ok || !plain || !type_ok) {
+		LOGW("[output] setup refused: type %s, plain %d, fields ok %d, dsd_mode %d",
+		     type, plain, ok, dsd_mode);
+		status = "RAAT__OUTPUT_PLUGIN_STATUS_FORMAT_NOT_SUPPORTED";
+	} else {
+		o = output_open(&d->pd, type, rate, bits, ch, dsd_mode, d->clock_carry, &status);
 	}
-	else
-		o = output_open(&d->pd, rate, bits, ch, d->clock_carry, &status);
 	if (!o) {
 		LOGW("[output] setup %s %d/%d/%d failed: %s", type, rate, bits, ch, status);
 		session_defer_setup_cb(s, cb_ref, false, 0, status);
@@ -200,12 +223,18 @@ static int o_send_message(lua_State *L)
 	return 0;
 }
 
-static void push_formats(lua_State *L, const pdev_t *pd)
+static void push_formats(lua_State *L, const mdev_t *d)
 {
+	const pdev_t *pd = &d->pd;
+	bool allow_dsd = device_dsd_mode(d) != DSD_MODE_NONE;
 	lua_createtable(L, pd->nfmts, 0);
+	int idx = 1;
 	for (int i = 0; i < pd->nfmts; i++) {
+		bool is_dsd = pd->fmts[i].bits == 1;
+		if (is_dsd && !allow_dsd)
+			continue;
 		lua_createtable(L, 0, 4);
-		lua_pushstring(L, "pcm");
+		lua_pushstring(L, is_dsd ? "dsd" : "pcm");
 		lua_setfield(L, -2, "sample_type");
 		lua_pushinteger(L, pd->fmts[i].rate);
 		lua_setfield(L, -2, "sample_rate");
@@ -213,7 +242,7 @@ static void push_formats(lua_State *L, const pdev_t *pd)
 		lua_setfield(L, -2, "bits_per_sample");
 		lua_pushinteger(L, pd->fmts[i].channels);
 		lua_setfield(L, -2, "channels");
-		lua_rawseti(L, -2, i + 1);
+		lua_rawseti(L, -2, idx++);
 	}
 }
 
@@ -222,7 +251,7 @@ static int o_refresh_supported_formats(lua_State *L)
 	session_t *s = session_of(L);
 	manager_refresh_devices();
 	if (lua_getglobal(L, "raat") == LUA_TTABLE && lua_getfield(L, -1, "output") == LUA_TTABLE) {
-		push_formats(L, &s->dev->pd);
+		push_formats(L, s->dev);
 		lua_setfield(L, -2, "supported_formats");
 	}
 	return 0;
@@ -275,7 +304,7 @@ void raat_push_output(lua_State *L, session_t *s)
 	lua_pushstring(L, info);
 	cJSON_free(info);
 	lua_setfield(L, -2, "info");
-	push_formats(L, &s->dev->pd);
+	push_formats(L, s->dev);
 	lua_setfield(L, -2, "supported_formats");
 	lua_newtable(L);
 	lua_pushvalue(L, -1);
